@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:mem"
@@ -148,19 +148,19 @@ buf_put_u32_at :: proc(b: ^Buf, at: int, v: u32) {
 	b.data[at+3] = u8(v >> 24)
 }
 
-read_u16le :: proc(p: []u8, at: int) -> u16 {
+read_u16le :: #force_inline proc(p: []u8, at: int) -> u16 #no_bounds_check {
 	return u16(p[at]) | u16(p[at+1]) << 8
 }
 
-read_u32le :: proc(p: []u8, at: int) -> u32 {
+read_u32le :: #force_inline proc(p: []u8, at: int) -> u32 #no_bounds_check {
 	return u32(p[at]) | u32(p[at+1]) << 8 | u32(p[at+2]) << 16 | u32(p[at+3]) << 24
 }
 
-read_u64le :: proc(p: []u8, at: int) -> u64 {
+read_u64le :: #force_inline proc(p: []u8, at: int) -> u64 #no_bounds_check {
 	return u64(read_u32le(p, at)) | u64(read_u32le(p, at+4)) << 32
 }
 
-read_i64le :: proc(p: []u8, at: int) -> i64 {
+read_i64le :: #force_inline proc(p: []u8, at: int) -> i64 #no_bounds_check {
 	return i64(read_u64le(p, at))
 }
 
@@ -223,14 +223,20 @@ arena_destroy :: proc(a: ^Arena) {
 FNV_BASIS :: u64(14695981039346656037)
 FNV_PRIME :: u64(1099511628211)
 
-fnv_continue :: proc(h: u64, s: string, fold := false) -> u64 {
+fnv_continue :: #force_inline proc(h: u64, s: string, fold := false) -> u64 #no_bounds_check {
 	x := h
-	for i := 0; i < len(s); i += 1 {
-		b := s[i]
-		if fold && b >= 'A' && b <= 'Z' {
-			b += 32
+	if fold {
+		for i in 0..<len(s) {
+			b := s[i]
+			if b >= 'A' && b <= 'Z' {
+				b += 32
+			}
+			x = (x ~ u64(b)) * FNV_PRIME
 		}
-		x = (x ~ u64(b)) * FNV_PRIME
+	} else {
+		for i in 0..<len(s) {
+			x = (x ~ u64(s[i])) * FNV_PRIME
+		}
 	}
 	return x
 }
@@ -525,7 +531,7 @@ Token_Iter :: struct {
 	i: int,
 }
 
-next_token :: proc(it: ^Token_Iter) -> (string, bool) {
+next_token :: #force_inline proc(it: ^Token_Iter) -> (string, bool) #no_bounds_check {
 	for it.i < len(it.s) && !is_word_byte(it.s[it.i]) {
 		it.i += 1
 	}

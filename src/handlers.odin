@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:encoding/json"
@@ -109,6 +109,7 @@ split_stream_fields :: proc(s: string, a: ^Arena) -> []string {
 		return nil
 	}
 	out: [dynamic]string
+	defer delete(out)
 	rest := s
 	for len(rest) > 0 {
 		c := strings.index_byte(rest, ',')
@@ -124,7 +125,13 @@ split_stream_fields :: proc(s: string, a: ^Arena) -> []string {
 			append(&out, arena_str(a, item))
 		}
 	}
-	return out[:]
+	if len(out) == 0 {
+		return nil
+	}
+	bytes := arena_alloc(a, len(out) * size_of(string), align_of(string))
+	fields := slice.from_ptr(cast(^string)raw_data(bytes), len(out))
+	copy(fields, out[:])
+	return fields
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -493,7 +500,7 @@ handle_query :: proc(srv: ^Server, params: Params, arena: ^Arena, resp: ^Http_Re
 		write_out_row(out, &r.rows[i], with_msg)
 	}
 	sync_add_query(srv)
-	resp.extra = arena_aprintf(arena, "X-Odlog-Scanned-Rows: %d\r\nX-Odlog-Matched-Rows: %d\r\nX-Odlog-Pruned-Blocks: %d\r\nX-Odlog-Elapsed-Ms: %d\r\n", r.scanned_rows, r.matched_rows, r.pruned_blocks, r.elapsed_ns / 1_000_000)
+	resp.extra = arena_aprintf(arena, "X-Oboe-Scanned-Rows: %d\r\nX-Oboe-Matched-Rows: %d\r\nX-Oboe-Pruned-Blocks: %d\r\nX-Oboe-Elapsed-Ms: %d\r\n", r.scanned_rows, r.matched_rows, r.pruned_blocks, r.elapsed_ns / 1_000_000)
 	return 200
 }
 
@@ -685,38 +692,38 @@ handle_cache :: proc(srv: ^Server, req: ^Http_Request, key: string, params: Para
 handle_metrics :: proc(srv: ^Server, out: ^Buf) {
 	st := store_stats(srv.store)
 	up := (now_ns() - srv.start_ns) / 1_000_000_000
-	buf_addf(out, "# HELP odlog_ingested_rows_total Rows accepted by the ingest API.\n")
-	buf_addf(out, "# TYPE odlog_ingested_rows_total counter\n")
-	buf_addf(out, "odlog_ingested_rows_total %d\n", sync.atomic_load(&srv.store.ingested_rows))
-	buf_addf(out, "odlog_ingested_bytes_total %d\n", sync.atomic_load(&srv.store.ingested_bytes))
-	buf_addf(out, "odlog_queries_total %d\n", sync.atomic_load(&srv.store.queries))
-	buf_addf(out, "odlog_flushed_parts_total %d\n", sync.atomic_load(&srv.store.flushed_parts))
-	buf_addf(out, "odlog_merged_parts_total %d\n", sync.atomic_load(&srv.store.merged_parts))
-	buf_addf(out, "odlog_parts %d\n", st.parts)
-	buf_addf(out, "odlog_partitions %d\n", st.partitions)
-	buf_addf(out, "odlog_mem_rows %d\n", st.mem_rows)
-	buf_addf(out, "odlog_rows %d\n", st.rows)
-	buf_addf(out, "odlog_disk_bytes %d\n", st.disk_bytes)
-	buf_addf(out, "odlog_http_requests_total %d\n", srv.requests)
-	buf_addf(out, "odlog_http_connections_total %d\n", srv.conns)
+	buf_addf(out, "# HELP oboe_ingested_rows_total Rows accepted by the ingest API.\n")
+	buf_addf(out, "# TYPE oboe_ingested_rows_total counter\n")
+	buf_addf(out, "oboe_ingested_rows_total %d\n", sync.atomic_load(&srv.store.ingested_rows))
+	buf_addf(out, "oboe_ingested_bytes_total %d\n", sync.atomic_load(&srv.store.ingested_bytes))
+	buf_addf(out, "oboe_queries_total %d\n", sync.atomic_load(&srv.store.queries))
+	buf_addf(out, "oboe_flushed_parts_total %d\n", sync.atomic_load(&srv.store.flushed_parts))
+	buf_addf(out, "oboe_merged_parts_total %d\n", sync.atomic_load(&srv.store.merged_parts))
+	buf_addf(out, "oboe_parts %d\n", st.parts)
+	buf_addf(out, "oboe_partitions %d\n", st.partitions)
+	buf_addf(out, "oboe_mem_rows %d\n", st.mem_rows)
+	buf_addf(out, "oboe_rows %d\n", st.rows)
+	buf_addf(out, "oboe_disk_bytes %d\n", st.disk_bytes)
+	buf_addf(out, "oboe_http_requests_total %d\n", srv.requests)
+	buf_addf(out, "oboe_http_connections_total %d\n", srv.conns)
 	if srv.cache != nil {
 		cs := cache_stats(srv.cache)
-		buf_addf(out, "odlog_cache_entries %d\n", cs.entries)
-		buf_addf(out, "odlog_cache_bytes %d\n", cs.bytes)
-		buf_addf(out, "odlog_cache_hits_total %d\n", cs.hits)
-		buf_addf(out, "odlog_cache_misses_total %d\n", cs.misses)
-		buf_addf(out, "odlog_cache_evictions_total %d\n", cs.evictions)
-		buf_addf(out, "odlog_cache_expirations_total %d\n", cs.expirations)
+		buf_addf(out, "oboe_cache_entries %d\n", cs.entries)
+		buf_addf(out, "oboe_cache_bytes %d\n", cs.bytes)
+		buf_addf(out, "oboe_cache_hits_total %d\n", cs.hits)
+		buf_addf(out, "oboe_cache_misses_total %d\n", cs.misses)
+		buf_addf(out, "oboe_cache_evictions_total %d\n", cs.evictions)
+		buf_addf(out, "oboe_cache_expirations_total %d\n", cs.expirations)
 	}
 	if srv.jobq != nil {
 		qs := queue_stats(srv.jobq)
-		buf_addf(out, "odlog_queue_jobs %d\n", qs.current_jobs)
-		buf_addf(out, "odlog_queue_ready %d\n", qs.ready)
-		buf_addf(out, "odlog_queue_reserved %d\n", qs.reserved)
-		buf_addf(out, "odlog_queue_delayed %d\n", qs.delayed)
-		buf_addf(out, "odlog_queue_buried %d\n", qs.buried)
-		buf_addf(out, "odlog_queue_connections %d\n", qs.connections)
-		buf_addf(out, "odlog_queue_puts_total %d\n", qs.total_jobs)
+		buf_addf(out, "oboe_queue_jobs %d\n", qs.current_jobs)
+		buf_addf(out, "oboe_queue_ready %d\n", qs.ready)
+		buf_addf(out, "oboe_queue_reserved %d\n", qs.reserved)
+		buf_addf(out, "oboe_queue_delayed %d\n", qs.delayed)
+		buf_addf(out, "oboe_queue_buried %d\n", qs.buried)
+		buf_addf(out, "oboe_queue_connections %d\n", qs.connections)
+		buf_addf(out, "oboe_queue_puts_total %d\n", qs.total_jobs)
 	}
-	buf_addf(out, "odlog_uptime_seconds %d\n", up)
+	buf_addf(out, "oboe_uptime_seconds %d\n", up)
 }

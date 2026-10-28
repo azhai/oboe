@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:os"
@@ -118,7 +118,7 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 					}
 					part, pok := open_part(pe.fullpath)
 					if !pok {
-						fmt.eprintf("odlog: dropping incomplete part %s\n", pe.fullpath)
+						fmt.eprintf("oboe: dropping incomplete part %s\n", pe.fullpath)
 						os.remove_all(pe.fullpath)
 						continue
 					}
@@ -136,6 +136,7 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 					}
 					delete(marker_path)
 				}
+				os.file_info_slice_delete(part_entries, context.allocator)
 			}
 			if len(superseded) > 0 {
 				kept := make([dynamic]^Disk_Part, 0, len(p.parts))
@@ -154,10 +155,11 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 			delete(parts_dir)
 			append(&s.partitions, p)
 		}
+		os.file_info_slice_delete(entries, context.allocator)
 	}
 	delete(partitions_dir)
 	if start_worker {
-		s.worker = thread.create_and_start_with_data(s, store_worker, self_cleanup = false, name = "odlog-store")
+		s.worker = thread.create_and_start_with_data(s, store_worker, self_cleanup = false, name = "oboe-store")
 	}
 	return s
 }
@@ -367,7 +369,7 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 		sync.rw_mutex_unlock(&s.mu)
 		sync.atomic_add(&s.flushed_parts, 1)
 	} else {
-		fmt.eprintf("odlog: flush failed for %s (%d rows)\n", p.dir, len(old_rows))
+		fmt.eprintf("oboe: flush failed for %s (%d rows)\n", p.dir, len(old_rows))
 		sync.rw_mutex_lock(&s.mu)
 		now := now_ns()
 		for i in 0..<len(old_rows) {
@@ -501,7 +503,7 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 	}
 	marker_path := fmt.aprintf("%s/merged_from", part.dir)
 	if werr := os.write_entire_file(marker_path, marker.data[:]); werr != nil {
-		fmt.eprintf("odlog: failed to write merge marker for %s\n", part.dir)
+		fmt.eprintf("oboe: failed to write merge marker for %s\n", part.dir)
 	}
 	delete(marker_path)
 	buf_destroy(&marker)

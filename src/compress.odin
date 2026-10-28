@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:c"
 import "vendor:zlib"
@@ -60,14 +60,14 @@ inflate_any :: proc(src: []u8, max_size: int = 512 << 20) -> ([]u8, bool) {
 		rc = zlib.inflate(&strm, 0)
 		produced := int((1 << 16) - strm.avail_out)
 		resize(&out, old + produced)
+		if len(out) > max_size {
+			delete(out)
+			return nil, false
+		}
 		if rc == zlib.STREAM_END {
 			break
 		}
 		if rc != zlib.OK {
-			delete(out)
-			return nil, false
-		}
-		if len(out) > max_size {
 			delete(out)
 			return nil, false
 		}

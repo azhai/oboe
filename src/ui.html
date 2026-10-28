@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>odlog — log explorer</title>
+<title>oboe — log explorer</title>
 <style>
   :root {
     --bg: #0a0d12;
@@ -180,7 +180,7 @@
 </head>
 <body>
 <header>
-  <div class="brand"><span class="dot"></span> odlog <small>log explorer</small></div>
+  <div class="brand"><span class="dot"></span> oboe <small>log explorer</small></div>
   <div class="stats" id="stats"><span>connecting…</span></div>
 </header>
 <main>
@@ -361,12 +361,12 @@
         else m[line] = 0;
       }
       const parts = [
-        `<b>${fmtNum(m.odlog_ingested_rows_total || 0)}</b> ingested`,
-        `<b>${fmtNum(m.odlog_rows || 0)}</b> on disk`,
-        `<b>${fmtNum(m.odlog_mem_rows || 0)}</b> in memory`,
-        `<b>${m.odlog_parts || 0}</b> parts`,
-        `<b>${fmtNum(m.odlog_disk_bytes || 0)}B</b> stored`,
-        `uptime <b>${fmtDuration(m.odlog_uptime_seconds || 0)}</b>`,
+        `<b>${fmtNum(m.oboe_ingested_rows_total || 0)}</b> ingested`,
+        `<b>${fmtNum(m.oboe_rows || 0)}</b> on disk`,
+        `<b>${fmtNum(m.oboe_mem_rows || 0)}</b> in memory`,
+        `<b>${m.oboe_parts || 0}</b> parts`,
+        `<b>${fmtNum(m.oboe_disk_bytes || 0)}B</b> stored`,
+        `uptime <b>${fmtDuration(m.oboe_uptime_seconds || 0)}</b>`,
       ];
       $("stats").innerHTML = parts.map((p) => `<span>${p}</span>`).join("");
     } catch (e) {
@@ -419,10 +419,10 @@
       meta.textContent = "";
       const bits = [
         ["rows", rows.length],
-        ["scanned", h("X-Odlog-Scanned-Rows")],
-        ["matched", h("X-Odlog-Matched-Rows")],
-        ["pruned blocks", h("X-Odlog-Pruned-Blocks")],
-        ["server", h("X-Odlog-Elapsed-Ms") + " ms"],
+        ["scanned", h("X-Oboe-Scanned-Rows")],
+        ["matched", h("X-Oboe-Matched-Rows")],
+        ["pruned blocks", h("X-Oboe-Pruned-Blocks")],
+        ["server", h("X-Oboe-Elapsed-Ms") + " ms"],
         ["client", ms + " ms"],
       ];
       for (const [k, v] of bits) {
@@ -430,7 +430,7 @@
         s.innerHTML = `${k} <b>${v}</b>`;
         meta.appendChild(s);
       }
-      try { localStorage.setItem("odlog:query", q); } catch (_) {}
+      try { localStorage.setItem("oboe:query", q); } catch (_) {}
     } catch (e) {
       showError(e.message || String(e));
     } finally {
@@ -459,7 +459,7 @@
     });
   });
   try {
-    const saved = localStorage.getItem("odlog:query");
+    const saved = localStorage.getItem("oboe:query");
     if (saved) qInput.value = saved;
   } catch (_) {}
 

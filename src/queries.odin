@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:strconv"

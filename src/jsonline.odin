@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 MAX_JSON_FIELDS :: 128
 

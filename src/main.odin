@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:os"
@@ -9,10 +9,10 @@ import "core:time"
 VERSION :: "0.2.0"
 
 usage :: proc() {
-	fmt.print(`odlog %s — high-performance log database, cache and job queue (Odin)
+	fmt.print(`oboe %s — high-performance log database, cache and job queue (Odin)
 
 Usage:
-  odlog [flags]
+  oboe [flags]
 
 Flags (logs):
   -data <dir>             data directory (default "./data")
@@ -48,6 +48,7 @@ HTTP endpoints:
   GET/PUT/DELETE /cache/<key>[?ttl=30s] in-memory cache
   GET  /cache/stats                     cache counters
   GET  /metrics                         Prometheus metrics
+  GET  /health                          health check (200 "OK")
   GET  /                                embedded web UI
 
 Queue protocol (beanstalkd-compatible subset):
@@ -111,7 +112,7 @@ main :: proc() {
 			usage()
 			return
 		case "-version", "--version":
-			fmt.println("odlog", VERSION)
+			fmt.println("oboe", VERSION)
 			return
 		case "-data", "--data":
 			if v, ok := next_arg(args, &i); ok {
@@ -197,7 +198,7 @@ main :: proc() {
 		case "-no-queue", "--no-queue":
 			queue_enabled = false
 		case:
-			fmt.eprintf("odlog: unknown flag %q\n\n", a)
+			fmt.eprintf("oboe: unknown flag %q\n\n", a)
 			usage()
 			os.exit(2)
 		}
@@ -213,7 +214,7 @@ main :: proc() {
 
 	if cache_enabled {
 		cache = cache_init(cache_cfg)
-		fmt.printf("odlog: cache enabled (max_bytes=%d, max_entries=%d, shards=%d)\n",
+		fmt.printf("oboe: cache enabled (max_bytes=%d, max_entries=%d, shards=%d)\n",
 			cache_cfg.max_bytes, cache_cfg.max_entries, CACHE_SHARDS)
 	}
 	if queue_enabled {

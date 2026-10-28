@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:os"
 import "core:testing"
@@ -71,7 +71,7 @@ test_query_parse :: proc(t: ^testing.T) {
 
 @(test)
 test_query_execute :: proc(t: ^testing.T) {
-	dir := "/tmp/odlog_query_test"
+	dir := "/tmp/oboe_query_test"
 	os.remove_all(dir)
 	cfg := default_store_config()
 	cfg.data_path = dir

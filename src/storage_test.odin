@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:os"
@@ -9,6 +9,8 @@ import "core:testing"
 test_block_roundtrip :: proc(t: ^testing.T) {
 	rows := make([]Row, 3)
 	fs := make([]Field, 6)
+	defer delete(rows)
+	defer delete(fs)
 	fs[0] = {name = "level", value = "error"}
 	fs[1] = {name = "service", value = "api"}
 	fs[2] = {name = "level", value = "info"}
@@ -22,6 +24,7 @@ test_block_roundtrip :: proc(t: ^testing.T) {
 	defer buf_destroy(&buf)
 	bb: Bloom_Builder
 	defer delete(bb.hashes)
+	defer delete(bb.table)
 	min_ts, max_ts, ok := encode_block(rows, &buf, &bb)
 	testing.expect(t, ok)
 	testing.expect_value(t, min_ts, i64(100))
@@ -51,7 +54,7 @@ test_block_roundtrip :: proc(t: ^testing.T) {
 
 @(test)
 test_store_roundtrip :: proc(t: ^testing.T) {
-	dir := "/tmp/odlog_store_test"
+	dir := "/tmp/oboe_store_test"
 	os.remove_all(dir)
 	cfg := default_store_config()
 	cfg.data_path = dir
@@ -69,6 +72,14 @@ test_store_roundtrip :: proc(t: ^testing.T) {
 	defer delete(rows)
 	fields := make([]Field, count * 3)
 	defer delete(fields)
+	defer {
+		for r in rows {
+			delete(r.msg)
+		}
+		for i := 2; i < len(fields); i += 3 {
+			delete(fields[i].value)
+		}
+	}
 	for i in 0..<count {
 		level := i % 3 == 0 ? "error" : "info"
 		fields[i*3+0] = {name = "level", value = level}
@@ -115,7 +126,7 @@ test_store_roundtrip :: proc(t: ^testing.T) {
 
 @(test)
 test_store_reload_after_merge :: proc(t: ^testing.T) {
-	dir := "/tmp/odlog_store_reload"
+	dir := "/tmp/oboe_store_reload"
 	os.remove_all(dir)
 	cfg := default_store_config()
 	cfg.data_path = dir

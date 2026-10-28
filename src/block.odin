@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 Row :: struct {
 	ts:     i64,
@@ -38,27 +38,14 @@ encode_block :: proc(rows: []Row, out: ^Buf, bloom: ^Bloom_Builder) -> (min_ts, 
 		}
 		delete(cols)
 	}
-	for ri in 0..<len(rows) {
+	nrows := len(rows)
+	for ri in 0..<nrows {
 		r := &rows[ri]
-		// message column
-		ci := find_enc_col(&cols, "_msg", ri)
-		if len(cols[ci].vals) == ri {
-			append(&cols[ci].vals, r.msg)
-		} else {
-			cols[ci].vals[ri] = r.msg
-		}
+		ci := find_enc_col(&cols, "_msg", nrows)
+		cols[ci].vals[ri] = r.msg
 		for f in r.fields {
-			ci = find_enc_col(&cols, f.name, ri)
-			if len(cols[ci].vals) == ri {
-				append(&cols[ci].vals, f.value)
-			} else {
-				cols[ci].vals[ri] = f.value
-			}
-		}
-		for &c in cols {
-			for len(c.vals) < len(rows) {
-				append(&c.vals, "")
-			}
+			ci = find_enc_col(&cols, f.name, nrows)
+			cols[ci].vals[ri] = f.value
 		}
 		bloom_builder_add_value(bloom, "_msg", r.msg)
 		for f in r.fields {
@@ -68,7 +55,7 @@ encode_block :: proc(rows: []Row, out: ^Buf, bloom: ^Bloom_Builder) -> (min_ts, 
 	buf_reset(out)
 	buf_string(out, BLOCK_MAGIC)
 	buf_u16le(out, BLOCK_VERSION)
-	buf_u32le(out, u32(len(rows)))
+	buf_u32le(out, u32(nrows))
 	buf_u32le(out, u32(len(cols)))
 	buf_u64le(out, rows[0].stream)
 	buf_i64le(out, min_ts)
@@ -103,18 +90,13 @@ encode_block :: proc(rows: []Row, out: ^Buf, bloom: ^Bloom_Builder) -> (min_ts, 
 	return min_ts, max_ts, true
 }
 
-find_enc_col :: proc(cols: ^[dynamic]Enc_Col, name: string, ri: int) -> int {
+find_enc_col :: proc(cols: ^[dynamic]Enc_Col, name: string, nrows: int) -> int {
 	for i in 0..<len(cols) {
 		if cols[i].name == name {
 			return i
 		}
 	}
-	c := Enc_Col{name = name}
-	c.vals = make([dynamic]string, 0, ri + 1)
-	for _ in 0..<ri {
-		append(&c.vals, "")
-	}
-	append(cols, c)
+	append(cols, Enc_Col{name = name, vals = make([dynamic]string, nrows)})
 	return len(cols) - 1
 }
 
@@ -139,7 +121,7 @@ Decoded_Block :: struct {
 }
 
 decode_block :: proc(raw: []u8) -> (d: Decoded_Block, ok: bool) {
-	if len(raw) < 4 || string(raw[0:4]) != BLOCK_MAGIC {
+	if len(raw) < 38 || string(raw[0:4]) != BLOCK_MAGIC {
 		return {}, false
 	}
 	at := 4
@@ -165,6 +147,12 @@ decode_block :: proc(raw: []u8) -> (d: Decoded_Block, ok: bool) {
 	}
 	ts_off := at
 	at += nrows * 8
+	scratch := make([]i32, nrows * 3)
+	defer delete(scratch)
+	counts := scratch[0:nrows]
+	starts := scratch[nrows:2*nrows]
+	fill := scratch[2*nrows:3*nrows]
+
 	cols := make([dynamic]Dec_Col, 0, ncols)
 	defer delete(cols)
 	for _ in 0..<ncols {
@@ -192,6 +180,11 @@ decode_block :: proc(raw: []u8) -> (d: Decoded_Block, ok: bool) {
 			c.is_const = true
 			c.const_v = string(raw[at:at+vlen])
 			at += vlen
+			if len(c.const_v) > 0 && c.name != "_msg" {
+				for i in 0..<nrows {
+					counts[i] += 1
+				}
+			}
 		} else {
 			c.lens_off = at
 			at += nrows * 4
@@ -199,9 +192,21 @@ decode_block :: proc(raw: []u8) -> (d: Decoded_Block, ok: bool) {
 			if at > len(raw) {
 				return {}, false
 			}
+			// Sum the length table here, validating the data range and counting
+			// non-empty non-message fields in the same pass.
 			total := 0
-			for i in 0..<nrows {
-				total += int(read_u32le(raw, c.lens_off + i * 4))
+			if c.name == "_msg" {
+				for i in 0..<nrows {
+					total += int(read_u32le(raw, c.lens_off + i * 4))
+				}
+			} else {
+				for i in 0..<nrows {
+					vlen := int(read_u32le(raw, c.lens_off + i * 4))
+					total += vlen
+					if vlen > 0 {
+						counts[i] += 1
+					}
+				}
 			}
 			if at + total > len(raw) {
 				return {}, false
@@ -211,61 +216,54 @@ decode_block :: proc(raw: []u8) -> (d: Decoded_Block, ok: bool) {
 		append(&cols, c)
 	}
 
-	// pass 1: count non-empty fields per row (excluding _msg)
-	counts := make([]i32, nrows)
-	defer delete(counts)
-	for i in 0..<nrows {
-		for c in cols {
-			vlen: int
-			if c.is_const {
-				vlen = len(c.const_v)
-			} else {
-				vlen = int(read_u32le(raw, c.lens_off + i * 4))
-			}
-			if vlen > 0 && c.name != "_msg" {
-				counts[i] += 1
-			}
-		}
-	}
-	starts := make([]i32, nrows)
-	defer delete(starts)
+	rows := make([]Row, nrows)
 	total_fields := 0
 	for i in 0..<nrows {
 		starts[i] = i32(total_fields)
 		total_fields += int(counts[i])
-	}
-	rows := make([]Row, nrows)
-	fields := make([]Field, total_fields)
-	fill := make([]i32, nrows)
-	defer delete(fill)
-	for i in 0..<nrows {
 		rows[i].ts = read_i64le(raw, ts_off + i * 8)
 		rows[i].stream = stream
 	}
-	// pass 2
-	for c in cols {
-		offset := c.data_off
-		for i in 0..<nrows {
-			vlen: int
-			v: string
-			if c.is_const {
-				vlen = len(c.const_v)
-				v = c.const_v
-			} else {
-				vlen = int(read_u32le(raw, c.lens_off + i * 4))
-				v = string(raw[offset:offset+vlen])
-				offset += vlen
-			}
-			if vlen == 0 {
+	fields := make([]Field, total_fields)
+	// pass 2: place values into each row's field slice
+	for &c in cols {
+		if c.is_const {
+			v := c.const_v
+			if len(v) == 0 {
 				continue
 			}
 			if c.name == "_msg" {
-				rows[i].msg = v
+				for i in 0..<nrows {
+					rows[i].msg = v
+				}
 				continue
 			}
-			pos := int(starts[i] + fill[i])
-			fields[pos] = Field{name = c.name, value = v}
-			fill[i] += 1
+			for i in 0..<nrows {
+				pos := int(starts[i] + fill[i])
+				fields[pos] = Field{name = c.name, value = v}
+				fill[i] += 1
+			}
+			continue
+		}
+		offset := c.data_off
+		if c.name == "_msg" {
+			for i in 0..<nrows {
+				vlen := int(read_u32le(raw, c.lens_off + i * 4))
+				if vlen > 0 {
+					rows[i].msg = string(raw[offset:offset+vlen])
+				}
+				offset += vlen
+			}
+			continue
+		}
+		for i in 0..<nrows {
+			vlen := int(read_u32le(raw, c.lens_off + i * 4))
+			if vlen > 0 {
+				pos := int(starts[i] + fill[i])
+				fields[pos] = Field{name = c.name, value = string(raw[offset:offset+vlen])}
+				fill[i] += 1
+			}
+			offset += vlen
 		}
 	}
 	for i in 0..<nrows {

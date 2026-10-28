@@ -1,5 +1,6 @@
-package odlog
+package oboe
 
+import "core:mem"
 import "core:strings"
 import "core:sync"
 
@@ -43,6 +44,9 @@ Cache_Shard :: struct {
 
 Cache :: struct {
 	cfg:          Cache_Config,
+	// Entries may be written by any thread but are freed by whichever thread
+	// evicts or destroys them, so allocation is pinned to the owner's allocator.
+	allocator:    mem.Allocator,
 	shards:       [CACHE_SHARDS]Cache_Shard,
 	hits:         u64,
 	misses:       u64,
@@ -66,6 +70,7 @@ Cache_Stats :: struct {
 cache_init :: proc(cfg: Cache_Config) -> ^Cache {
 	c := new(Cache)
 	c.cfg = cfg
+	c.allocator = context.allocator
 	for i in 0..<CACHE_SHARDS {
 		sh := &c.shards[i]
 		sh.entries = make(map[string]^Cache_Entry)
@@ -85,11 +90,11 @@ cache_destroy :: proc(c: ^Cache) {
 		e := sh.head
 		for e != nil {
 			next := e.next
-			delete(e.key)
+			delete(e.key, c.allocator)
 			if e.value != nil {
-				delete(e.value)
+				delete(e.value, c.allocator)
 			}
-			free(e)
+			free(e, c.allocator)
 			e = next
 		}
 		delete(sh.entries)
@@ -141,19 +146,18 @@ lru_touch :: proc(sh: ^Cache_Shard, e: ^Cache_Entry) {
 	lru_push_front(sh, e)
 }
 
-entry_remove :: proc(sh: ^Cache_Shard, e: ^Cache_Entry) {
+entry_remove :: proc(sh: ^Cache_Shard, e: ^Cache_Entry, allocator: mem.Allocator) {
 	lru_unlink(sh, e)
 	delete_key(&sh.entries, e.key)
 	sh.bytes -= i64(len(e.value))
-	delete(e.key)
+	delete(e.key, allocator)
 	if e.value != nil {
-		delete(e.value)
+		delete(e.value, allocator)
 	}
-	free(e)
+	free(e, allocator)
 }
 
 	cache_get_into :: proc(c: ^Cache, key: string, out: ^Buf) -> bool {
-	now := now_ns()
 	sh := cache_shard(c, key)
 	sync.mutex_lock(&sh.mu)
 	e, ok := sh.entries[key]
@@ -162,8 +166,8 @@ entry_remove :: proc(sh: ^Cache_Shard, e: ^Cache_Entry) {
 		sync.atomic_add(&c.misses, 1)
 		return false
 	}
-	if cache_expired(e, now) {
-		entry_remove(sh, e)
+	if e.expires_ns != 0 && cache_expired(e, now_ns()) {
+		entry_remove(sh, e, c.allocator)
 		sync.mutex_unlock(&sh.mu)
 		sync.atomic_add(&c.expirations, 1)
 		sync.atomic_add(&c.misses, 1)
@@ -183,10 +187,9 @@ cache_get :: proc(c: ^Cache, key: string) -> ([]u8, bool) {
 	sh := cache_shard(c, key)
 	sync.mutex_lock(&sh.mu)
 	e, ok := sh.entries[key]
-	now := now_ns()
 	if ok {
-		if cache_expired(e, now) {
-			entry_remove(sh, e)
+		if e.expires_ns != 0 && cache_expired(e, now_ns()) {
+			entry_remove(sh, e, c.allocator)
 			sync.atomic_add(&c.expirations, 1)
 		} else {
 			lru_touch(sh, e)
@@ -211,33 +214,33 @@ cache_set :: proc(c: ^Cache, key: string, value: []u8, ttl_ns: i64) -> bool {
 	if c.cfg.max_value > 0 && len(value) > c.cfg.max_value {
 		return false
 	}
-	now := now_ns()
 	sh := cache_shard(c, key)
 	if sh.max_bytes > 0 && i64(len(value)) > sh.max_bytes {
 		return false
 	}
 	expires: i64
 	if ttl_ns > 0 {
+		now := now_ns()
 		expires = now + ttl_ns
 		if expires < now {
 			expires = i64(0x7fffffffffffffff)
 		}
 	}
-	val := make([]u8, len(value))
+	val := make([]u8, len(value), c.allocator)
 	copy(val, value)
 
 	sync.mutex_lock(&sh.mu)
 	if e, ok := sh.entries[key]; ok {
 		sh.bytes += i64(len(val)) - i64(len(e.value))
 		if e.value != nil {
-			delete(e.value)
+			delete(e.value, c.allocator)
 		}
 		e.value = val
 		e.expires_ns = expires
 		lru_touch(sh, e)
 	} else {
-		e := new(Cache_Entry)
-		e.key = strings.clone(key)
+		e := new(Cache_Entry, c.allocator)
+		e.key = strings.clone(key, c.allocator)
 		e.value = val
 		e.expires_ns = expires
 		sh.entries[e.key] = e
@@ -251,12 +254,12 @@ cache_set :: proc(c: ^Cache, key: string, value: []u8, ttl_ns: i64) -> bool {
 		if victim == nil {
 			break
 		}
-		if cache_expired(victim, now) {
+		if victim.expires_ns != 0 && cache_expired(victim, now_ns()) {
 			sync.atomic_add(&c.expirations, 1)
 		} else {
 			sync.atomic_add(&c.evictions, 1)
 		}
-		entry_remove(sh, victim)
+		entry_remove(sh, victim, c.allocator)
 	}
 	sync.mutex_unlock(&sh.mu)
 	sync.atomic_add(&c.sets, 1)
@@ -268,7 +271,7 @@ cache_delete :: proc(c: ^Cache, key: string) -> bool {
 	sync.mutex_lock(&sh.mu)
 	e, ok := sh.entries[key]
 	if ok {
-		entry_remove(sh, e)
+		entry_remove(sh, e, c.allocator)
 	}
 	sync.mutex_unlock(&sh.mu)
 	if ok {

@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:encoding/json"
 import "core:fmt"
@@ -290,6 +290,7 @@ part_writer_destroy :: proc(pw: ^Part_Writer) {
 	buf_destroy(&pw.index_buf)
 	buf_destroy(&pw.block_buf)
 	delete(pw.bloom_b.hashes)
+	delete(pw.bloom_b.table)
 	delete(pw.rows)
 	arena_destroy(&pw.arena)
 	delete(pw.dir)

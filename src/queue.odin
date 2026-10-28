@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:strings"
 import "core:sync"
@@ -342,7 +342,7 @@ queue_init :: proc(cfg: Queue_Config) -> ^Queue {
 	q.next_conn = 1
 	q.created_ns = now_ns()
 	queue_tube_locked(q, QUEUE_DEFAULT_TUBE)
-	q.worker = thread.create_and_start_with_data(q, queue_worker, self_cleanup = false, name = "odlog-queue")
+	q.worker = thread.create_and_start_with_data(q, queue_worker, self_cleanup = false, name = "oboe-queue")
 	return q
 }
 
@@ -418,13 +418,19 @@ tube_bury :: proc(t: ^Tube, j: ^Job) {
 }
 
 queue_put :: proc(q: ^Queue, tube_name: string, pri: u32, delay_ns, ttr_ns: i64, body: []u8) -> (u64, Queue_Put_Result) {
+	if q.cfg.max_job_bytes > 0 && len(body) > q.cfg.max_job_bytes {
+		return 0, .TOO_BIG
+	}
+	// Copy the payload before taking the queue lock: the copy can be large and
+	// every producer contends on the same mutex.
+	payload := make([]u8, len(body))
+	copy(payload, body)
+
 	sync.mutex_lock(&q.mu)
 	defer sync.mutex_unlock(&q.mu)
 	if q.cfg.max_jobs > 0 && len(q.jobs) >= q.cfg.max_jobs {
+		delete(payload)
 		return 0, .DRAINING
-	}
-	if q.cfg.max_job_bytes > 0 && len(body) > q.cfg.max_job_bytes {
-		return 0, .TOO_BIG
 	}
 	now := now_ns()
 	t := queue_tube_locked(q, tube_name)
@@ -435,8 +441,7 @@ queue_put :: proc(q: ^Queue, tube_name: string, pri: u32, delay_ns, ttr_ns: i64,
 	j.seq = q.next_seq
 	q.next_seq += 1
 	j.tube = t
-	j.body = make([]u8, len(body))
-	copy(j.body, body)
+	j.body = payload
 	j.created_ns = now
 	j.ttr_ns = ttr_ns
 	if delay_ns > 0 {

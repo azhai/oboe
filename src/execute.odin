@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:slice"
@@ -198,16 +198,7 @@ arena_fields :: proc(a: ^Arena, n: int) -> []Out_Field {
 	return slice.from_ptr(cast(^Out_Field)raw_data(bytes), n)
 }
 
-intern_name :: proc(names: ^map[string]string, a: ^Arena, name: string) -> string {
-	if v, ok := names[name]; ok {
-		return v
-	}
-	clone := arena_str(a, name)
-	names[clone] = clone
-	return clone
-}
-
-copy_row_out :: proc(r: ^Row, a: ^Arena, names: ^map[string]string) -> Out_Row {
+copy_row_out :: proc(r: ^Row, a: ^Arena) -> Out_Row {
 	out := Out_Row{
 		ts       = r.ts,
 		has_time = true,
@@ -217,7 +208,7 @@ copy_row_out :: proc(r: ^Row, a: ^Arena, names: ^map[string]string) -> Out_Row {
 	out.fields = arena_fields(a, len(r.fields))
 	for i in 0..<len(r.fields) {
 		out.fields[i] = Out_Field{
-			name  = intern_name(names, a, r.fields[i].name),
+			name  = arena_str(a, r.fields[i].name),
 			value = arena_str(a, r.fields[i].value),
 		}
 	}
@@ -272,6 +263,80 @@ out_row_less :: proc(a, b: ^Out_Row, specs: []Sort_Spec) -> bool {
 		}
 	}
 	return false
+}
+
+compare_row_out :: proc(r: ^Row, o: ^Out_Row, name: string) -> int {
+	if name == "_time" {
+		if r.ts < o.ts {
+			return -1
+		}
+		if r.ts > o.ts {
+			return 1
+		}
+		return 0
+	}
+	av, _ := row_get_field(r, name)
+	bv, _ := out_row_get(o, name)
+	an, aok := numeric(av)
+	bn, bok := numeric(bv)
+	if aok && bok && an != bn {
+		if an < bn {
+			return -1
+		}
+		return 1
+	}
+	return strings.compare(av, bv)
+}
+
+// row_before_out orders a scan row against an already-materialized output row
+// without copying it, so sort queries only pay for candidates that reach the
+// result set.
+row_before_out :: proc(r: ^Row, o: ^Out_Row, specs: []Sort_Spec) -> bool {
+	for s in specs {
+		c := compare_row_out(r, o, s.name)
+		if c != 0 {
+			if s.desc {
+				return c > 0
+			}
+			return c < 0
+		}
+	}
+	return false
+}
+
+// The result rows form a max-heap on the requested sort order: the root is the
+// row that would sort last, i.e. the first candidate to evict.
+heap_sift_up :: proc(rows: ^[dynamic]Out_Row, at: int, specs: []Sort_Spec) {
+	i := at
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !out_row_less(&rows[parent], &rows[i], specs) {
+			break
+		}
+		rows[parent], rows[i] = rows[i], rows[parent]
+		i = parent
+	}
+}
+
+heap_sift_down :: proc(rows: ^[dynamic]Out_Row, specs: []Sort_Spec) {
+	n := len(rows)
+	i := 0
+	for {
+		l := 2 * i + 1
+		if l >= n {
+			break
+		}
+		big := l
+		r := l + 1
+		if r < n && out_row_less(&rows[l], &rows[r], specs) {
+			big = r
+		}
+		if !out_row_less(&rows[i], &rows[big], specs) {
+			break
+		}
+		rows[i], rows[big] = rows[big], rows[i]
+		i = big
+	}
 }
 
 sort_out_rows :: proc(rows: []Out_Row, specs: []Sort_Spec) {
@@ -374,7 +439,6 @@ Scan_Tally :: struct {
 
 Exec_State :: struct {
 	res:      ^Query_Result,
-	names:    ^map[string]string,
 	rows:     ^[dynamic]Out_Row,
 	groups:   ^[dynamic]Stats_Group,
 	group_index: ^map[string]int,
@@ -384,8 +448,8 @@ Exec_State :: struct {
 	stats:    bool,
 	has_sort: bool,
 	specs:    []Sort_Spec,
-	trim_at:  int,
 	limit:    int,
+	truncated: bool,
 }
 
 ensure_group :: proc(st: ^Exec_State, r: ^Row) -> int {
@@ -408,7 +472,7 @@ ensure_group :: proc(st: ^Exec_State, r: ^Row) -> int {
 	for k in 0..<len(st.by) {
 		v, _ := row_get_field(r, st.by[k])
 		g.by[k] = Out_Field{
-			name  = intern_name(st.names, &st.res.arena, st.by[k]),
+			name  = arena_str(&st.res.arena, st.by[k]),
 			value = arena_str(&st.res.arena, v),
 		}
 	}
@@ -456,14 +520,20 @@ exec_consume :: proc(st: ^Exec_State, r: ^Row) -> bool {
 		stats_update(&st.groups[gi], r, st.aggs)
 		return false
 	}
-	append(st.rows, copy_row_out(r, &st.res.arena, st.names))
 	if st.has_sort {
-		if len(st.rows) >= st.trim_at {
-			sort_out_rows(st.rows[:], st.specs)
-			resize(st.rows, st.limit)
+		if len(st.rows) < st.limit {
+			append(st.rows, copy_row_out(r, &st.res.arena))
+			heap_sift_up(st.rows, len(st.rows) - 1, st.specs)
+		} else {
+			st.truncated = true
+			if row_before_out(r, &st.rows[0], st.specs) {
+				st.rows[0] = copy_row_out(r, &st.res.arena)
+				heap_sift_down(st.rows, st.specs)
+			}
 		}
 		return false
 	}
+	append(st.rows, copy_row_out(r, &st.res.arena))
 	return len(st.rows) >= st.limit
 }
 
@@ -507,9 +577,6 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 	want_stats := stats_idx >= 0
 
 	rows: [dynamic]Out_Row
-	names: map[string]string
-	defer delete_map(names)
-
 	groups: [dynamic]Stats_Group
 	group_index: map[string]int
 	defer {
@@ -532,7 +599,6 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 
 	st := Exec_State{
 		res      = &res,
-		names    = &names,
 		rows     = &rows,
 		groups   = &groups,
 		group_index = &group_index,
@@ -543,7 +609,6 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 		has_sort = has_sort,
 		specs    = sort_specs,
 		limit    = limit,
-		trim_at  = max(limit * 2, 4096),
 	}
 	// A stats pipe without a `by` clause must still report a zero group when
 	// nothing matches.
@@ -700,6 +765,9 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 	}
 	if len(rows) > limit {
 		resize(&rows, limit)
+		res.truncated = true
+	}
+	if st.truncated {
 		res.truncated = true
 	}
 

@@ -1,4 +1,4 @@
-# odlog
+# oboe
 
 用 [Odin](https://odin-lang.org/) 编写的高性能日志服务，存储与查询架构参照
 [VictoriaLogs](https://github.com/VictoriaMetrics/VictoriaLogs)，并附带：
@@ -8,11 +8,13 @@
 
 单个二进制同时提供日志写入/查询、Web UI、Prometheus 指标、缓存和队列服务。
 
+更多文档：[架构说明](docs/architecture.md) · [测试指南](docs/testing.md)。
+
 ## 快速开始
 
 ```bash
-odin build src -out:odlog
-./odlog -data ./data
+odin build src -out:oboe
+./oboe -data ./data
 ```
 
 默认监听：
@@ -25,11 +27,16 @@ odin build src -out:odlog
 ```bash
 curl -X POST http://127.0.0.1:9428/insert/jsonline \
   -H 'Content-Type: application/x-ndjson' \
-  --data-binary $'{"_time":"2026-10-26T04:00:00Z","level":"error","service":"api","msg":"boom"}\n'
+  --data-binary $'{"_time":"2026-10-26T04:00:00Z","level":"error","service":"api","_msg":"boom"}\n'
 
+# 裸词匹配 _msg；field:value 匹配普通字段
 curl 'http://127.0.0.1:9428/select/logsql/query?query=level%3Aerror&limit=100'
+curl 'http://127.0.0.1:9428/select/logsql/query?query=boom'
 curl 'http://127.0.0.1:9428/select/logsql/query?query=*%20%7C%20stats%20by%20(service)%20count()%20as%20total'
 ```
+
+`_msg` 与 `_time` 是保留字段名；接入其他格式时可用 `_msg_field`、`_time_field` 指定映射。
+普通字段（如 `level`、`service`）保持原字段名，可通过 `_stream_fields` 选择构成 stream 的字段。
 
 浏览器打开 `http://127.0.0.1:9428/` 使用内置 Web UI。
 
@@ -70,11 +77,11 @@ ingest (JSON line / ES bulk / Loki push)
 ```
 data/
   partitions/
-    2026-10-26/
+    20261026/
       parts/
         p_0000000000000007/
           meta.json     # 行数、时间范围、stream 数、block 数、块行数
-          index.bin     # 每块的 streams / columns / bloom / 数据偏移
+          index.bin     # 每块的 stream、时间范围、行数、数据/bloom 偏移
           data.bin      # zlib 压缩的列式块
           bloom.bin     # 每块字段值 bloom filter
           merged_from   # 合并产物标记，记录被替换的 part id
@@ -109,8 +116,8 @@ data/
 ```
 
 HTTP 查询参数：`query`、`limit`、`start`、`end`。
-响应为 NDJSON，并返回 `X-Odlog-Scanned-Rows`、`X-Odlog-Matched-Rows`、
-`X-Odlog-Pruned-Blocks`、`X-Odlog-Elapsed-Ms` 便于观察裁剪效果。
+响应为 NDJSON，并返回 `X-Oboe-Scanned-Rows`、`X-Oboe-Matched-Rows`、
+`X-Oboe-Pruned-Blocks`、`X-Oboe-Elapsed-Ms` 便于观察裁剪效果。
 
 ## HTTP API
 
@@ -125,6 +132,7 @@ HTTP 查询参数：`query`、`limit`、`start`、`end`。
 | `GET/PUT/DELETE` | `/cache/<key>` | 缓存读写删 |
 | `GET` | `/cache/stats` | 缓存统计 |
 | `GET` | `/metrics` | Prometheus 指标 |
+| `GET` | `/health` | 健康检查，返回 `OK` |
 | `GET` | `/` | 内置 Web UI |
 
 写入参数：`_time_field`、`_msg_field`、`_stream_fields`。
@@ -149,7 +157,7 @@ curl http://127.0.0.1:9428/cache/stats
 - LRU 淘汰，读取时惰性清理过期项。
 - 值以副本存储，读取返回独立副本，避免调用方释放后悬垂。
 - 仅驻留内存，重启后为空。
-- `/metrics` 暴露 `odlog_cache_entries/bytes/hits_total/misses_total/evictions_total/expirations_total`。
+- `/metrics` 暴露 `oboe_cache_entries/bytes/hits_total/misses_total/evictions_total/expirations_total`。
 
 ## 任务队列（beanstalkd 协议子集）
 
@@ -177,7 +185,7 @@ printf 'put 0 0 60 5\r\nhello\r\nreserve-with-timeout 1\r\n' | nc 127.0.0.1 1130
 - 客户端断开时，其 reserved job 自动回到 ready。
 - `stats` / `stats-tube` / `stats-job` 返回 beanstalkd 风格 YAML。
 - job 只存内存，进程退出即丢失；无持久化与主从复制。
-- 队列指标：`odlog_queue_jobs/ready/reserved/delayed/buried/connections/puts_total`。
+- 队列指标：`oboe_queue_jobs/ready/reserved/delayed/buried/connections/puts_total`。
 
 ## 并发模型
 
@@ -192,27 +200,46 @@ printf 'put 0 0 60 5\r\nhello\r\nreserve-with-timeout 1\r\n' | nc 127.0.0.1 1130
 需要 Odin `dev-2026-10` 或更新版本。
 
 ```bash
-odin build src -out:odlog
-odin test src
+odin build src -out:oboe
+odin test src                        # 40 个用例
+odin test src -define:ODIN_STRESS=1  # 追加 3 个并发压力用例
 ```
 
-测试覆盖块编解码、存储读写、合并后重启一致性、LogsQL 查询、缓存 TTL/LRU/容量限制、
-队列优先级/延迟/TTR/bury/kick/pause/断线回收，共 15 个用例。
+测试覆盖工具函数（大小/时长/时间解析、缓冲区与编码）、zlib/gzip 压缩、JSON 行解析、
+bloom filter、块编解码、存储落盘与合并后重启一致性、LogsQL 解析与执行、HTTP 路由与
+三种写入协议、缓存 TTL/LRU/容量限制/并发、队列优先级/延迟/TTR/bury/kick/pause/断线回收，
+共 40 个用例且无内存泄漏；`-define:ODIN_STRESS=1` 另加存储（并发写入 + 并发 flush/merge
++ 并发查询）、缓存和队列的并发压力用例。详见 [测试指南](docs/testing.md)。
 
-## 性能参考
+测试使用 `/tmp/oboe_*` 作为临时目录，结束后自动清理；可与现有数据目录并存。
 
-单机 macOS arm64 实测（数据仅供量级参考）：
+## 基准测试
 
-| 场景 | 结果 |
-| --- | --- |
-| 预生成 20 万行写入，1 连接 | 约 535k rows/s |
-| 预生成 20 万行写入，4 连接 | 约 1.83M rows/s |
-| 100 万行落盘体积 | 约 32 MB（zlib） |
-| 全量扫描 100 万行 | 约 870 ms |
-| `level:error \| limit 100` | <1 ms，裁剪 13 个块 |
-| `level:error \| stats by (service)` | 约 32 ms，裁剪 306 个块 |
-| 不存在的值过滤 | 约 4 ms，扫描 0 个块 |
-| 全量 `stats by (service)` | 约 544 ms |
+`bench/` 是独立的压测驱动，覆盖写入（含落盘）、查询、缓存和队列：
+
+```bash
+odin run bench -- -mode all                          # 全量，默认 20 万行 / 8 线程
+odin run bench -- -mode ingest -rows 1000000         # 1 输入 + 落盘吞吐
+odin run bench -- -mode query -rows 200000 -reps 20  # 四种查询形态
+odin run bench -- -mode cache -ops 100000 -threads 8
+odin run bench -- -mode queue -rows 200000 -threads 8
+```
+
+单机 macOS arm64 实测（20 万行、8 线程，数据仅供量级参考）：
+
+| 场景 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 写入（memtable） | 4.8M rows/s | 4.8M rows/s |
+| 写入 + 落盘 | 174k rows/s | 约 500k rows/s |
+| `level:error \| limit 100` | 2.3k q/s（0.43 ms） | 5.2k q/s（0.19 ms） |
+| `level:error \| stats by (service)` | 248 q/s（4.0 ms） | 407 q/s（2.5 ms） |
+| `* \| sort by (_time) desc \| limit 100` | 37 q/s（27 ms） | 107 q/s（9.3 ms） |
+| 缓存混合读写 | 9.2M ops/s | 8.7M ops/s（未改动，波动） |
+| 队列 put/reserve/delete | 374k jobs/s | 444k jobs/s |
+
+本轮优化集中在：块编码按最终列宽预分配（去掉逐行补齐）、bloom 构建去重与块内重复值
+记忆化、解码单遍统计、查询侧去掉字段名 intern、`sort` 改为 limit 大小的 top-N 堆、
+队列负载拷贝移出全局锁、缓存惰性读取时钟。
 
 ## 已知限制
 

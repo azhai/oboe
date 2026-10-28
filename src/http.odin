@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:net"
@@ -332,7 +332,7 @@ http_send :: proc(sock: net.TCP_Socket, code: int, ctype: string, body: []u8, ke
 	buf_addf(&hdr, "Content-Length: %d\r\n", len(body))
 	buf_addf(&hdr, "Connection: %s\r\n", keep_alive ? "keep-alive" : "close")
 	buf_string(&hdr, CORS_HEADERS)
-	buf_string(&hdr, "Server: odlog\r\n")
+	buf_string(&hdr, "Server: oboe\r\n")
 	if len(extra) > 0 {
 		buf_string(&hdr, extra)
 	}
@@ -478,12 +478,12 @@ serve_connection :: proc(srv: ^Server, sock: net.TCP_Socket) {
 server_run :: proc(srv: ^Server) -> bool {
 	ep, ok := parse_listen(srv.cfg.listen)
 	if !ok {
-		fmt.eprintf("odlog: invalid listen address %q\n", srv.cfg.listen)
+		fmt.eprintf("oboe: invalid listen address %q\n", srv.cfg.listen)
 		return false
 	}
 	sock, lerr := net.listen_tcp(ep, 4096)
 	if lerr != nil {
-		fmt.eprintf("odlog: cannot listen on %s: %v\n", srv.cfg.listen, lerr)
+		fmt.eprintf("oboe: cannot listen on %s: %v\n", srv.cfg.listen, lerr)
 		return false
 	}
 	srv.listener = sock
@@ -492,10 +492,10 @@ server_run :: proc(srv: ^Server) -> bool {
 		workers = 1
 	}
 	for _ in 0..<workers {
-		w := thread.create_and_start_with_data(srv, http_worker, self_cleanup = false, name = "odlog-http")
+		w := thread.create_and_start_with_data(srv, http_worker, self_cleanup = false, name = "oboe-http")
 		append(&srv.workers, w)
 	}
-	fmt.printf("odlog: listening on http://%s (workers=%d, data=%s)\n", srv.cfg.listen, workers, srv.store.cfg.data_path)
+	fmt.printf("oboe: listening on http://%s (workers=%d, data=%s)\n", srv.cfg.listen, workers, srv.store.cfg.data_path)
 	for sync.atomic_load(&srv.stopping) == 0 {
 		client, _, aerr := net.accept_tcp(sock)
 		if aerr != nil {

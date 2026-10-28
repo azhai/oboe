@@ -1,4 +1,4 @@
-package odlog
+package oboe
 
 import "core:fmt"
 import "core:net"
@@ -40,19 +40,19 @@ QConn :: struct {
 queue_server_start :: proc(q: ^Queue) -> ^Queue_Server {
 	ep, ok := parse_listen(q.cfg.listen)
 	if !ok {
-		fmt.eprintf("odlog: invalid queue listen address %q\n", q.cfg.listen)
+		fmt.eprintf("oboe: invalid queue listen address %q\n", q.cfg.listen)
 		return nil
 	}
 	sock, lerr := net.listen_tcp(ep, 1024)
 	if lerr != nil {
-		fmt.eprintf("odlog: cannot listen for queue on %s: %v\n", q.cfg.listen, lerr)
+		fmt.eprintf("oboe: cannot listen for queue on %s: %v\n", q.cfg.listen, lerr)
 		return nil
 	}
 	qs := new(Queue_Server)
 	qs.q = q
 	qs.listener = sock
-	qs.acceptor = thread.create_and_start_with_data(qs, queue_accept_loop, self_cleanup = false, name = "odlog-queue")
-	fmt.printf("odlog: queue listening on tcp://%s (beanstalk protocol)\n", q.cfg.listen)
+	qs.acceptor = thread.create_and_start_with_data(qs, queue_accept_loop, self_cleanup = false, name = "oboe-queue")
+	fmt.printf("oboe: queue listening on tcp://%s (beanstalk protocol)\n", q.cfg.listen)
 	return qs
 }
 
@@ -88,7 +88,7 @@ queue_accept_loop :: proc(data: rawptr) {
 		}
 		args := new(Queue_Conn_Args)
 		args^ = Queue_Conn_Args{q = q, id = queue_new_conn(q), sock = client}
-		thread.create_and_start_with_data(args, queue_conn_thread, self_cleanup = true, name = "odlog-queue-conn")
+		thread.create_and_start_with_data(args, queue_conn_thread, self_cleanup = true, name = "oboe-queue-conn")
 	}
 }
 
