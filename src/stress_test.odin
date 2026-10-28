@@ -358,6 +358,127 @@ test_stress_cache_concurrent :: proc(t: ^testing.T) {
 	}
 }
 
+Stress_Cache_Saver :: struct {
+	c:        ^Cache,
+	path:     string,
+	stop:     ^u32,
+	saves:    ^u64,
+	failures: ^u32,
+}
+
+stress_cache_saver :: proc(data: rawptr) {
+	a := cast(^Stress_Cache_Saver)data
+	for sync.atomic_load(a.stop) == 0 {
+		if _, ok := cache_save_file(a.c, a.path); ok {
+			sync.atomic_add(a.saves, 1)
+		} else {
+			sync.atomic_add(a.failures, 1)
+		}
+		time.sleep(2 * time.Millisecond)
+	}
+}
+
+@(test)
+test_stress_cache_save_load :: proc(t: ^testing.T) {
+	// Saving must produce a consistent, loadable snapshot while writers are
+	// mutating the cache.
+	saved_context := context
+	context.allocator = runtime.default_allocator()
+	defer context = saved_context
+
+	dir := "/tmp/oboe_stress_cache_file"
+	os.remove_all(dir)
+	defer os.remove_all(dir)
+	os.make_directory_all(dir)
+	path := fmt.aprintf("%s/cache.bin", dir)
+	defer delete(path)
+
+	cfg := default_cache_config()
+	cfg.max_bytes = 64 << 20
+	cfg.max_entries = 0
+	c := cache_init(cfg)
+	defer cache_destroy(c)
+
+	start: u32
+	failures: u32
+	saves: u64
+	stop: u32
+	args := make([]Stress_Cache_Args, STRESS_THREADS)
+	workers := make([]^thread.Thread, STRESS_THREADS)
+	defer {
+		delete(args)
+		delete(workers)
+	}
+	for i in 0..<STRESS_THREADS {
+		args[i] = Stress_Cache_Args{c = c, start = &start, tid = i, failures = &failures}
+		workers[i] = thread.create_and_start_with_data(&args[i], stress_cache_worker, self_cleanup = false)
+	}
+	saver := Stress_Cache_Saver{c = c, path = path, stop = &stop, saves = &saves, failures = &failures}
+	saver_thread := thread.create_and_start_with_data(&saver, stress_cache_saver, self_cleanup = false)
+
+	sync.atomic_store(&start, 1)
+	for w in workers {
+		thread.join(w)
+		thread.destroy(w)
+	}
+	time.sleep(10 * time.Millisecond)
+	sync.atomic_store(&stop, 1)
+	thread.join(saver_thread)
+	thread.destroy(saver_thread)
+
+	testing.expect_value(t, failures, u32(0))
+	testing.expect(t, saves > 0)
+
+	big := make([]u8, 100 << 10)
+	defer delete(big)
+	for i in 0..<len(big) {
+		big[i] = u8('a' + i % 26)
+	}
+	testing.expect(t, cache_set(c, "stress:cache:big", big, 0))
+
+	before := cache_stats(c)
+	if _, ok := cache_save_file(c, path); !ok {
+		testing.expectf(t, false, "final save failed")
+		return
+	}
+	loaded, lok := cache_load_file(cfg, path)
+	if !lok {
+		testing.expectf(t, false, "loading final save failed")
+		return
+	}
+	defer cache_destroy(loaded)
+
+	after := cache_stats(loaded)
+	testing.expectf(t, after.entries == before.entries, "entries=%d want %d", after.entries, before.entries)
+	testing.expectf(t, after.bytes == before.bytes, "bytes=%d want %d", after.bytes, before.bytes)
+
+	buf := buf_init(64)
+	defer buf_destroy(&buf)
+	missing := 0
+	for i in 0..<STRESS_THREADS {
+		for k in 0..<STRESS_CACHE_KEYS {
+			if k % 2 == 0 {
+				continue
+			}
+			key := fmt.aprintf("stress:cache:%d:%d", i, k)
+			buf_reset(&buf)
+			if !cache_get_into(loaded, key, &buf) {
+				missing += 1
+			} else if want := fmt.aprintf("value-%d-%d", i, k); string(buf.data[:]) != want {
+				missing += 1
+				delete(want)
+			}
+			delete(key)
+		}
+	}
+	testing.expectf(t, missing == 0, "missing=%d keys after load", missing)
+
+	buf_reset(&buf)
+	if ok := cache_get_into(loaded, "stress:cache:big", &buf); !ok || string(buf.data[:]) != string(big) {
+		testing.expectf(t, false, "big value not preserved")
+	}
+}
+
 // ------------------------------------------------------------ queue
 
 Stress_Queue_Prod_Args :: struct {

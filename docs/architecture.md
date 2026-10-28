@@ -10,7 +10,7 @@
 ```
 main
  ├─ Store          日志存储（memtable / part / merge / retention）
- ├─ Cache          16 分片 LRU + TTL 缓存
+ ├─ Cache          桶式分代缓存 + TTL（可选文件快照）
  ├─ Queue          beanstalkd 兼容任务队列
  └─ HTTP Server    accept 循环 + worker 池，路由到 ingest/query/cache/metrics/UI
       └─ Queue Server（独立 TCP 端口，每连接一个线程）
@@ -18,6 +18,10 @@ main
 
 `main.odin` 只负责解析命令行、装配组件和优雅关闭；业务逻辑都在各模块中，HTTP
 `dispatch` 不依赖真实 socket，因此可以在测试里直接调用。
+
+`src/` 整体是单个 `package oboe`，可以被其他程序直接导入使用：导入时 `main.odin`
+中的 `main` 过程不会执行，只作为可执行入口存在。库用法与组件生命周期见
+[库用法](library.md)，可运行示例在 `examples/embed`。
 
 ### 源码地图
 
@@ -34,7 +38,8 @@ main
 | `block.odin` | 列式块编解码 |
 | `bloom.odin` | 每块 bloom filter 的构建与查询 |
 | `compress.odin` | zlib/gzip 压缩、解压与大小上限 |
-| `cache.odin` | 分片 LRU + TTL 缓存 |
+| `cache.odin` | fastcache 风格桶/chunk/分代缓存、大值 FIFO、TTL |
+| `cache_file.odin` | 缓存快照的保存/加载、周期保存线程 |
 | `queue.odin` | job/tube 状态机与堆 |
 | `queue_server.odin` | beanstalkd 文本协议与连接管理 |
 | `util.odin` | 时间/大小解析、缓冲区、arena、编码辅助 |
@@ -226,14 +231,44 @@ timestamps: nrows * i64
 
 ## 6. 缓存
 
-- 16 个分片，`FNV(key) % 16` 选片；每片独立互斥锁和 LRU 双向链表。
-- 总容量和条目上限按分片均分（向上取整）。
-- `GET` 命中会触碰 LRU；过期项在读取时惰性删除并计入 `expirations`。
-- 写入超限时从 LRU 尾部淘汰；值在写入和读取时各复制一次，调用方拿到的始终是独立
-  副本。
-- 条目可能由任意线程写入、由任意线程淘汰，因此 key/value/entry 统一使用
-  `cache_init` 时捕获的 allocator 分配和释放。
-- key 上限 1024 字节，value 上限由 `-cache-max-value` 控制；仅驻留内存。
+设计参照 [fastcache](https://github.com/VictoriaMetrics/fastcache)，以桶为单位管理内存：
+
+- 512 个桶（`CACHE_BUCKETS`），`hash(key) & (bucket_count-1)` 选桶；`max_bytes` 或
+  `max_entries` 很小时桶数自动降到 16，避免每桶预算过小。
+- 每桶内存由 64 KiB 的 chunk 组成，按需追加；写入在 chunk 内顺序推进，写满最后一
+  个 chunk 后回到开头，并把代数（generation）加一。槽位 `gen << 40 | offset` 中
+  offset 为 40 位，gen 为 24 位（跳过 0）。
+- 槽位是否有效由当前代与上一代（以及回绕）决定：`cache_slot_valid` 只做几次整数
+  比较，读取路径不需要链表、时间戳更新或额外元数据；整代被覆盖即完成批量淘汰，
+  淘汰数量记为 `evictions`。
+- 单个 value 放不进桶内剩余 chunk（约 64 KiB）时进入该桶的大值 FIFO；大值按
+  `max_big_bytes`（`max_bytes / bucket_count`）淘汰最旧项。单条 value 即便超过桶预算
+  也会保留（淘汰会停在刚写入的新项），否则大于 `max_bytes/bucket_count` 的值永远
+  无法缓存；后续写入会先淘汰这条旧值。
+- 每桶一把 `RWMutex`：`cache_get_into` 持共享锁，`cache_set/delete/stats` 持独占锁。
+  每桶一个 `map[u64]u64` 保存 `hash -> slot`（哈希碰撞在 map 内解决），槽位再按
+  40 位 offset 定位 chunk 中的记录；记录头为 `key_len:u16 | val_len:u16 | expires:i64`。
+- 条目上限按桶均分（`max_entries / bucket_count`），超出时清理该桶的 map 并推进
+  代数；因此全局条数是近似值。
+- TTL 为绝对纳秒时间戳；`cache_get_into` 命中后若已过期，会在独占锁内复核并删除，
+  计入 `expirations`。`cache_stats` 逐桶扫描有效槽位，顺带清理过期项；它需要
+  O(entries) 时间并短暂独占每个桶，因此高频抓取 `/metrics` 会带来相应开销。
+- key 上限 1024 字节，value 上限由 `-cache-max-value` 控制。
+
+### 6.1 快照文件
+
+- `cache_save_file` 写 `<path>.tmp`：头部为 `"ODCA" + version(=1) + bucket_count +
+  chunk_size + max_chunks`，随后每桶一段 `{raw_len:u64, comp_len:u64, zlib(blob)}`；
+  blob 内含代数、写指针、存活 `(hash, slot)` 对、全部 chunk 以及大值 FIFO。
+- 写完后 `os.sync`，再 `rename` 覆盖目标文件，避免进程中断留下半个文件。
+- 加载时校验魔数、版本、chunk_size，并要求 `bucket_count/max_chunks` 与当前配置
+  推导出的几何参数一致；每段数据都做长度上界检查。加载会丢弃已过期条目，重建 map
+  与 FIFO，因此 `entries/bytes` 与保存时可能略有差异。
+- `-cache-file` 非空时启动加载；`-cache-save-interval > 0` 时后台线程按间隔保存
+  （`save_mu` 串行化所有保存），`server_run` 正常返回时再保存一次，`POST /cache/save`
+  可立即触发一次保存。进程被信号直接终止时不执行退出保存，此时以周期保存为准。
+- 快照是一次全量拷贝，保存期间写操作继续；因此快照不保证跨桶的精确时间点一致，
+  但每个桶内部的记录总是自洽的。
 
 ## 7. 任务队列
 
@@ -264,7 +299,8 @@ timestamps: nrows * i64
 2. **memtable 只在锁内读写**；flush 在锁外写盘，失败可安全重放。
 3. **查询持共享锁完成整个扫描**，flush/merge 的元数据变更持独占锁。
 4. **stream id 稳定**：相同 stream 字段和值在任何进程、任何顺序下得到相同 id。
-5. **缓存条目所有权统一**：分配与释放使用缓存自己的 allocator，与调用线程无关。
+5. **缓存条目所有权统一**：chunk、大值、map 槽位都使用缓存自己的 allocator，与
+   调用线程无关；快照保存持 `save_mu` 串行化，加载在装配完成前不对其他线程可见。
 6. **队列只依赖自身锁**：HTTP 线程只读队列统计，不参与 job 状态迁移。
 
 ## 10. 可观测性
@@ -275,7 +311,7 @@ timestamps: nrows * i64
 | --- | --- |
 | 写入/存储 | `oboe_ingested_rows_total`、`oboe_ingested_bytes_total`、`oboe_flushed_parts_total`、`oboe_merged_parts_total`、`oboe_parts`、`oboe_partitions`、`oboe_mem_rows`、`oboe_rows`、`oboe_disk_bytes` |
 | 查询/HTTP | `oboe_queries_total`、`oboe_http_requests_total`、`oboe_http_connections_total`、`oboe_uptime_seconds` |
-| 缓存 | `oboe_cache_entries`、`oboe_cache_bytes`、`oboe_cache_hits_total`、`oboe_cache_misses_total`、`oboe_cache_evictions_total`、`oboe_cache_expirations_total` |
+| 缓存 | `oboe_cache_entries`、`oboe_cache_bytes`、`oboe_cache_hits_total`、`oboe_cache_misses_total`、`oboe_cache_evictions_total`、`oboe_cache_expirations_total`、`oboe_cache_collisions_total` |
 | 队列 | `oboe_queue_jobs`、`oboe_queue_ready`、`oboe_queue_reserved`、`oboe_queue_delayed`、`oboe_queue_buried`、`oboe_queue_connections`、`oboe_queue_puts_total` |
 
 查询裁剪效果优先看响应头，不进入指标，避免高基数标签。

@@ -626,15 +626,32 @@ handle_cache :: proc(srv: ^Server, req: ^Http_Request, key: string, params: Para
 		return 503
 	}
 	cache_key := pct_decode(key, arena)
+	if cache_key == "save" {
+		if req.method != "POST" {
+			buf_string(&resp.body, `{"error":"method not allowed"}`)
+			return 405
+		}
+		if len(srv.cache_file) == 0 {
+			buf_string(&resp.body, `{"error":"cache file not configured"}`)
+			return 400
+		}
+		bytes, ok := cache_save_file(c, srv.cache_file)
+		if !ok {
+			buf_string(&resp.body, `{"error":"cache save failed"}`)
+			return 500
+		}
+		buf_addf(&resp.body, `{{"saved":true,"bytes":%d}}`, bytes)
+		return 200
+	}
 	if len(cache_key) == 0 || cache_key == "stats" {
 		if req.method != "GET" {
 			buf_string(&resp.body, `{"error":"method not allowed"}`)
 			return 405
 		}
 		st := cache_stats(c)
-		buf_addf(&resp.body, `{{"entries":%d,"bytes":%d,"hits":%d,"misses":%d,"evictions":%d,"expirations":%d,"sets":%d,"deletes":%d,"max_bytes":%d,"max_entries":%d}}`,
+		buf_addf(&resp.body, `{{"entries":%d,"bytes":%d,"hits":%d,"misses":%d,"evictions":%d,"expirations":%d,"sets":%d,"deletes":%d,"collisions":%d,"buckets":%d,"max_bytes":%d,"max_entries":%d}}`,
 			st.entries, st.bytes, st.hits, st.misses, st.evictions, st.expirations,
-			st.sets, st.deletes, c.cfg.max_bytes, c.cfg.max_entries)
+			st.sets, st.deletes, st.collisions, len(c.buckets), c.cfg.max_bytes, c.cfg.max_entries)
 		return 200
 	}
 	if len(cache_key) > CACHE_MAX_KEY {
@@ -714,6 +731,7 @@ handle_metrics :: proc(srv: ^Server, out: ^Buf) {
 		buf_addf(out, "oboe_cache_misses_total %d\n", cs.misses)
 		buf_addf(out, "oboe_cache_evictions_total %d\n", cs.evictions)
 		buf_addf(out, "oboe_cache_expirations_total %d\n", cs.expirations)
+		buf_addf(out, "oboe_cache_collisions_total %d\n", cs.collisions)
 	}
 	if srv.jobq != nil {
 		qs := queue_stats(srv.jobq)

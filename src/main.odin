@@ -4,12 +4,14 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 
 VERSION :: "0.2.0"
 
 usage :: proc() {
-	fmt.print(`oboe %s — high-performance log database, cache and job queue (Odin)
+	fmt.printf(`oboe %s — high-performance log database, cache and job queue (Odin)
 
 Usage:
   oboe [flags]
@@ -26,8 +28,10 @@ Flags (logs):
 
 Flags (cache):
   -cache-size <size>      in-memory capacity, e.g. 256MB, 8GB (default 256MB, 0 = unlimited)
-  -cache-max-entries <n>  max cached keys (default 1000000, 0 = unlimited)
+  -cache-max-entries <n>  approximate max cached keys (default 1000000, 0 = unlimited)
   -cache-max-value <size> max value size (default 16MB)
+  -cache-file <path>      load the cache from <path> on start and save back to it
+  -cache-save-interval <dur> periodic save interval (default 1m, 0 = no periodic saves)
   -no-cache               disable the cache entirely
 
 Flags (job queue):
@@ -47,6 +51,7 @@ HTTP endpoints:
   GET  /select/logsql/field_values      field values for a query
   GET/PUT/DELETE /cache/<key>[?ttl=30s] in-memory cache
   GET  /cache/stats                     cache counters
+  POST /cache/save                      persist the cache to -cache-file
   GET  /metrics                         Prometheus metrics
   GET  /health                          health check (200 "OK")
   GET  /                                embedded web UI
@@ -102,6 +107,8 @@ main :: proc() {
 	queue_cfg := default_queue_config()
 	cache_enabled := true
 	queue_enabled := true
+	cache_file := ""
+	cache_save_interval := time.Minute
 
 	args := os.args[1:]
 	i := 0
@@ -174,6 +181,16 @@ main :: proc() {
 					cache_cfg.max_value = int(n)
 				}
 			}
+		case "-cache-file", "--cache-file":
+			if v, ok := next_arg(args, &i); ok {
+				cache_file = v
+			}
+		case "-cache-save-interval", "--cache-save-interval":
+			if v, ok := next_arg(args, &i); ok {
+				if d, dok := parse_duration_arg(v); dok && d >= 0 {
+					cache_save_interval = d
+				}
+			}
 		case "-no-cache", "--no-cache":
 			cache_enabled = false
 		case "-queue-listen", "--queue-listen":
@@ -213,9 +230,20 @@ main :: proc() {
 	qs: ^Queue_Server
 
 	if cache_enabled {
-		cache = cache_init(cache_cfg)
-		fmt.printf("oboe: cache enabled (max_bytes=%d, max_entries=%d, shards=%d)\n",
-			cache_cfg.max_bytes, cache_cfg.max_entries, CACHE_SHARDS)
+		if len(cache_file) > 0 {
+			if loaded, lok := cache_load_file(cache_cfg, cache_file); lok {
+				cache = loaded
+				st := cache_stats(cache)
+				fmt.printf("oboe: cache loaded from %s (entries=%d, bytes=%d)\n", cache_file, st.entries, st.bytes)
+			} else {
+				fmt.printf("oboe: cache file %s not loaded, starting empty\n", cache_file)
+				cache = cache_init(cache_cfg)
+			}
+		} else {
+			cache = cache_init(cache_cfg)
+		}
+		fmt.printf("oboe: cache enabled (max_bytes=%d, max_entries=%d, buckets=%d)\n",
+			cache_cfg.max_bytes, cache_cfg.max_entries, len(cache.buckets))
 	}
 	if queue_enabled {
 		jobq = queue_init(queue_cfg)
@@ -225,7 +253,28 @@ main :: proc() {
 			jobq = nil
 		}
 	}
+
+	saver: Cache_Saver
+	saver_thread: ^thread.Thread
+	if cache != nil && len(cache_file) > 0 {
+		// Saves also happen on a clean return from server_run; a signal-killed
+		// process only has the periodic saves (or POST /cache/save) to rely on.
+		if cache_save_interval > 0 {
+			saver = Cache_Saver{
+				c =        cache,
+				path =     strings.clone(cache_file),
+				interval = cache_save_interval,
+			}
+			saver_thread = thread.create_and_start_with_data(&saver, cache_saver_run, self_cleanup = false)
+		}
+	}
+
 	defer {
+		if saver_thread != nil {
+			sync.atomic_store(&saver.stop, 1)
+			thread.join(saver_thread)
+			thread.destroy(saver_thread)
+		}
 		if qs != nil {
 			queue_server_stop(qs)
 		}
@@ -233,12 +282,23 @@ main :: proc() {
 			queue_destroy(jobq)
 		}
 		if cache != nil {
+			if len(cache_file) > 0 {
+				if bytes, sok := cache_save_file(cache, cache_file); sok {
+					fmt.printf("oboe: cache saved to %s (%d bytes)\n", cache_file, bytes)
+				} else {
+					fmt.eprintf("oboe: cache save to %s failed\n", cache_file)
+				}
+			}
 			cache_destroy(cache)
+		}
+		if saver.path != "" {
+			delete(saver.path)
 		}
 	}
 
 	srv := server_init(server_cfg, store, cache, jobq)
 	srv.cfg.stream_fields = store_cfg.stream_fields
+	srv.cache_file = cache_file
 	if !server_run(srv) {
 		os.exit(1)
 	}

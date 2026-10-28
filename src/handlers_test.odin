@@ -183,6 +183,24 @@ test_dispatch_cache_api :: proc(t: ^testing.T) {
 	r = handlers_test_do(env, &arena, "PUT", path, "", "x")
 	testing.expect_value(t, r.code, 400)
 
+	// /cache/save: requires POST and a configured file.
+	r = handlers_test_do(env, &arena, "POST", "/cache/save", "", "")
+	testing.expect_value(t, r.code, 400)
+	testing.expect(t, strings.contains(r.body, "cache file not configured"))
+
+	save_path := "/tmp/oboe_handlers_cache/cache.bin"
+	env.srv.cache_file = save_path
+	r = handlers_test_do(env, &arena, "GET", "/cache/save", "", "")
+	testing.expect_value(t, r.code, 405)
+
+	r = handlers_test_do(env, &arena, "PUT", "/cache/saved-key", "", "persist")
+	testing.expect_value(t, r.code, 200)
+	r = handlers_test_do(env, &arena, "POST", "/cache/save", "", "")
+	testing.expect_value(t, r.code, 200)
+	testing.expect(t, strings.contains(r.body, `"saved":true`))
+	testing.expect(t, os.exists(save_path))
+	env.srv.cache_file = ""
+
 	env.srv.cache = nil
 	r = handlers_test_do(env, &arena, "GET", "/cache/anything", "", "")
 	testing.expect_value(t, r.code, 503)

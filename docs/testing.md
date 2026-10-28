@@ -1,8 +1,8 @@
 # 测试指南
 
 oboe 的测试全部位于 `src/*_test.odin`，使用 Odin 内置的 `core:testing` 测试运行器。
-默认共 **40 个用例**，并行执行，且在此构建下无内存泄漏或 bad-free 报告。
-`src/stress_test.odin` 里的 3 个并发压力用例默认不参与编译，需显式开启（见下文）。
+默认共 **45 个用例**，并行执行，且在此构建下无内存泄漏或 bad-free 报告。
+`src/stress_test.odin` 里的 4 个并发压力用例默认不参与编译，需显式开启（见下文）。
 
 ## 1. 运行
 
@@ -17,6 +17,9 @@ odin test src
 
 # 追加并发压力测试
 odin test src -define:ODIN_STRESS=1
+
+# 库用法示例（不启动端口，打印存储/查询、缓存、队列结果）
+odin run examples/embed
 ```
 
 常用选项（通过 `-define:` 传给测试运行器）：
@@ -35,10 +38,10 @@ odin test src -define:ODIN_TEST_RANDOM_SEED=1
 `odin test` 默认开启内存跟踪。成功时输出只有一行：
 
 ```
-Finished 40 tests in 104.176ms. All tests were successful.
+Finished 45 tests in 104.176ms. All tests were successful.
 ```
 
-开启压力测试时为 `Finished 43 tests ...`。
+开启压力测试时为 `Finished 49 tests ...`。
 
 若出现 `+++ leak` 或 `bad free`，测试仍可能通过，但说明有分配未释放；这类问题应
 视为失败修复。
@@ -54,10 +57,10 @@ Finished 40 tests in 104.176ms. All tests were successful.
 | `storage_test.odin` | 3 | 块编解码、5000 行落盘/读回/合并、合并后重启的行数与序号恢复 |
 | `query_test.odin` | 2 | LogsQL 解析（过滤器/管道/时间）、查询执行（裁剪、limit、sort、stats、字段裁剪） |
 | `handlers_test.odin` | 4 | 进程内 `dispatch`：写入→查询→字段名/值→指标/UI/错误码；缓存 HTTP API；ES bulk 与 Loki push；参数与分行工具 |
-| `http_test.odin` | 2 | 监听地址解析、状态码文本、CRLF 行扫描 |
-| `cache_test.odin` | 5 | 基本读写删、TTL 过期、容量/value/key 限制、LRU 淘汰、4 线程并发读写 |
+| `http_test.odin` | 3 | 监听地址解析、状态码文本、CRLF 行扫描、未启动 server 的销毁与重复 stop |
+| `cache_test.odin` | 9 | 基本读写删、TTL 过期、容量/value/key 限制、桶内整代淘汰、条目上限、大值 FIFO、超桶预算的大值、快照保存/加载（几何校验、过期过滤、损坏文件）、4 线程并发读写 |
 | `queue_test.odin` | 6 | 优先级与 reserve/delete、delay、TTR 超时重入、bury/release/kick、kick/pause、上限与断线回收 |
-| `stress_test.odin` | 3 | **按需**：并发写入 + 并发 flush/merge + 并发查询的最终一致性、缓存 8 线程读写删校验、队列 4 生产者/4 消费者恰一次投递 |
+| `stress_test.odin` | 4 | **按需**：并发写入 + 并发 flush/merge + 并发查询的最终一致性、缓存 8 线程读写删校验、缓存边写边保存并重载校验、队列 4 生产者/4 消费者恰一次投递 |
 
 ### 并发压力测试
 
@@ -69,10 +72,13 @@ Finished 40 tests in 104.176ms. All tests were successful.
   用 `stats count()` 校验总数、`level`/`service` 及组合过滤的精确行数。
 - **缓存**：8 个线程各持有 64 个互不重叠的 key，4 轮 set/get 校验、删除半数再校验，
   并验证共享 key 与 TTL 过期。
+- **缓存快照**：在 8 个写线程持续 set/get 的同时，后台线程每 2 ms 调用一次
+  `cache_save_file`；结束后保存最终快照并加载，校验条目数、字节数、所有未删除 key
+  的值以及 100 KiB 大值完整保留。
 - **队列**：4 生产者各 put 5000 个 job，4 消费者 reserve/delete，按 job id 位图校验
   “恰好消费一次”，最终 `current_jobs/ready/reserved` 归零。
 
-这三个用例会把共享结构（Cache/Store/Queue）交给 worker 线程分配和释放，因此测试体
+这些用例会把共享结构（Cache/Store/Queue）交给 worker 线程分配和释放，因此测试体
 入口把 `context.allocator` 临时切换为进程堆（`runtime.default_allocator()`）。测试运行
 器的 per-task allocator 是单线程的 rollback stack，跨线程使用会破坏内存。
 
@@ -119,9 +125,9 @@ odin test src -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES=oboe.test_xxx
 
 **Q：什么时候需要跑 `-define:ODIN_STRESS=1`？**
 
-改动存储 flush/merge、缓存分片、队列并发路径，或发布前做回归时。压力测试会真正启动
-几十个线程并写 `/tmp/oboe_stress_store`，耗时明显长于普通用例；日常修改工具函数或
-解析器时只跑默认套件即可。
+改动存储 flush/merge、缓存桶/分代或快照格式、队列并发路径，或发布前做回归时。压力
+测试会真正启动几十个线程并写 `/tmp/oboe_stress_store`，耗时明显长于普通用例；日常
+修改工具函数或解析器时只跑默认套件即可。
 
 **Q：如何只验证改名/构建没有破坏代码？**
 
@@ -145,6 +151,7 @@ grep -rn 'odlog' src README.md docs
 ## 5. 新增测试的检查清单
 
 - [ ] 新用例在 `odin test src` 中通过，且没有 leak/bad-free 报告。
+- [ ] 若改动了公开 API 或组件生命周期，`odin run examples/embed` 仍能正常退出。
 - [ ] 不依赖外部网络和真实端口。
 - [ ] 临时文件/目录在成功和失败路径上都会清理。
 - [ ] 覆盖至少一个正常路径和一个边界/错误路径。

@@ -367,6 +367,7 @@ Server :: struct {
 	cfg:       Server_Config,
 	store:     ^Store,
 	cache:     ^Cache,
+	cache_file: string,
 	jobq:      ^Queue,
 	listener:  net.TCP_Socket,
 	mu:        sync.Mutex,
@@ -520,7 +521,10 @@ server_run :: proc(srv: ^Server) -> bool {
 
 server_stop :: proc(srv: ^Server) {
 	sync.atomic_store(&srv.stopping, 1)
-	net.close(srv.listener)
+	if srv.listener != 0 {
+		net.close(srv.listener)
+		srv.listener = 0
+	}
 	sync.mutex_lock(&srv.mu)
 	sync.cond_broadcast(&srv.cond)
 	sync.mutex_unlock(&srv.mu)
@@ -529,4 +533,25 @@ server_stop :: proc(srv: ^Server) {
 	}
 	delete(srv.workers)
 	srv.workers = nil
+}
+
+// server_destroy stops a running server, closes connections that were still
+// queued for a worker, and frees the Server itself. It is safe to call on a
+// server that was never started.
+server_destroy :: proc(srv: ^Server) {
+	if srv == nil {
+		return
+	}
+	if srv.listener != 0 {
+		server_stop(srv)
+	} else {
+		delete(srv.workers)
+		srv.workers = nil
+	}
+	for sock in srv.queue {
+		net.close(sock)
+	}
+	delete(srv.queue)
+	srv.queue = nil
+	free(srv)
 }
