@@ -16,34 +16,55 @@ main
       └─ Queue Server（独立 TCP 端口，每连接一个线程）
 ```
 
-`main.odin` 只负责解析命令行、装配组件和优雅关闭；业务逻辑都在各模块中，HTTP
-`dispatch` 不依赖真实 socket，因此可以在测试里直接调用。
+源码按职责拆成多个包，依赖单向，不存在包级循环：
 
-`src/` 整体是单个 `package oboe`，可以被其他程序直接导入使用：导入时 `main.odin`
-中的 `main` 过程不会执行，只作为可执行入口存在。库用法与组件生命周期见
-[库用法](library.md)，可运行示例在 `examples/embed`。
+```
+common  ←  netio  ←  queue
+common  ←  logdb
+common  ←  cache
+common  +  netio  +  logdb  +  cache  +  queue  ←  web  ←  cmd
+```
+
+`queue/queue_server.odin` 复用 `netio` 的 TCP 行读取，因此 `queue` 还依赖 `netio`。
+各包职责、新代码放置位置和禁止的反向依赖见 [模块与包布局](modules.md)。
+
+`cmd/` 是唯一可执行入口，只负责解析命令行、装配组件和优雅关闭；业务逻辑都在各库包中，
+HTTP `dispatch` 不依赖真实 socket，因此可以在测试里直接调用。库用法与组件生命周期见
+[库用法](library.md)，可运行示例在 `examples/logs`、`examples/cache`、
+`examples/queue`、`examples/embed`。
+
+进程生命周期（`cmd/main.odin`）：
+
+- 第一次 `SIGINT`/`SIGTERM`：信号处理器只把停止标志原子置位并关闭监听套接字，
+  `server_run` 返回后主线程依次 join HTTP worker、停 `Cache_Saver`、停队列服务、
+  保存缓存快照、`store_close`，最后以退出码 0 退出。
+- 第二次信号：在主线程清理期间立即以 130（`SIGINT`）/143（`SIGTERM`）退出，
+  不再等待 flush/保存。
+- 启动失败（监听地址非法或被占用）：`server_run` 返回 false，defer 链仍执行，
+  CLI 以退出码 1 退出。
 
 ### 源码地图
 
-| 文件 | 职责 |
-| --- | --- |
-| `main.odin` | 命令行参数、组件创建/销毁、版本号 |
-| `http.odin` | TCP accept、worker 池、HTTP/1.1 请求解析与响应、超时 |
-| `handlers.odin` | 路由、三种写入协议、查询/字段名/字段值、缓存 HTTP API、Prometheus 指标 |
-| `jsonline.odin` | JSON 行解析、`_time`/`_msg` 提取、stream id 计算 |
-| `queries.odin` | LogsQL 词法/语法分析、时间范围合并 |
-| `execute.odin` | 查询执行、块裁剪、过滤、sort/stats/fields/limit |
-| `store.odin` | 分区、memtable、flush、merge、retention、启动恢复 |
-| `part.odin` | part 目录的写入/读取、`index.bin`、`meta.json` |
-| `block.odin` | 列式块编解码 |
-| `bloom.odin` | 每块 bloom filter 的构建与查询 |
-| `compress.odin` | zlib/gzip 压缩、解压与大小上限 |
-| `cache.odin` | fastcache 风格桶/chunk/分代缓存、大值 FIFO、TTL |
-| `cache_file.odin` | 缓存快照的保存/加载、周期保存线程 |
-| `queue.odin` | job/tube 状态机与堆 |
-| `queue_server.odin` | beanstalkd 文本协议与连接管理 |
-| `util.odin` | 时间/大小解析、缓冲区、arena、编码辅助 |
-| `ui.odin` / `ui.html` | 编译期内嵌的 Web UI |
+| 包 | 文件 | 职责 |
+| --- | --- | --- |
+| `common` | `common/util.odin` | 时间/大小解析、缓冲区、arena、编码辅助、token/FNV |
+| `common` | `common/compress.odin` | zlib/gzip 压缩、解压与大小上限 |
+| `netio` | `netio/netio.odin` | 缓冲 TCP 行读取、监听地址解析 |
+| `logdb` | `logdb/store.odin` | 分区、memtable、flush、merge、retention、启动恢复 |
+| `logdb` | `logdb/part.odin` | part 目录的写入/读取、`index.bin`、`meta.json` |
+| `logdb` | `logdb/block.odin` | 列式块编解码 |
+| `logdb` | `logdb/bloom.odin` | 每块 bloom filter 的构建与查询 |
+| `logdb` | `logdb/jsonline.odin` | JSON 行解析、`_time`/`_msg` 提取、stream id 计算 |
+| `logdb` | `logdb/queries.odin` | LogsQL 词法/语法分析、时间范围合并 |
+| `logdb` | `logdb/execute.odin` | 查询执行、块裁剪、过滤、sort/stats/fields/limit |
+| `cache` | `cache/cache.odin` | fastcache 风格桶/chunk/分代缓存、大值 FIFO、TTL |
+| `cache` | `cache/cache_file.odin` | 缓存快照的保存/加载、周期保存线程 |
+| `queue` | `queue/queue.odin` | job/tube 状态机与堆 |
+| `queue` | `queue/queue_server.odin` | beanstalkd 文本协议与连接管理 |
+| `web` | `web/http.odin` | TCP accept、worker 池、HTTP/1.1 请求解析与响应、超时 |
+| `web` | `web/handlers.odin` | 路由、三种写入协议、查询/字段名/字段值、缓存 HTTP API、Prometheus 指标 |
+| `web` | `web/ui.odin` / `web/ui.html` | 编译期内嵌的 Web UI |
+| `cmd` | `cmd/main.odin` | 命令行参数、组件创建/销毁、信号处理与优雅关闭、版本号 |
 
 ## 2. 写入路径
 
@@ -149,8 +170,8 @@ timestamps: nrows * i64
 
 每个块一份 bloom filter，直接按 `bloom_off/bloom_len` 定位：
 
-- 7 个哈希位置；最小 1 KiB，最大 32 KiB（`BLOOM_MAX_BITS`），按唯一 token 数约
-  10 bit/项向上取 2 的幂。
+- 7 个哈希位置；最小 128 B（1024 bit），最大 32 KiB（`BLOOM_MAX_BITS` = 262144 bit），
+  按唯一 token 数约 10 bit/项向上取 2 的幂。
 - 构建时索引两种 key：消息/字段值中的 **token（大小写折叠）**，以及不超过 512
   字节的 **完整值（不折叠）**。
 - 同一块内重复的字段值会命中构建器的直接映射记忆表（`Bloom_Memo`，256 槽，按
@@ -219,7 +240,9 @@ timestamps: nrows * i64
 ### 5.2 保留
 
 每 60 s 执行一次：`cutoff = 今天(UTC) - retention_days`，删除 `day < cutoff` 的
-整个分区（含 memtable 与 part 目录）。`retention_days = 0` 关闭过期删除。
+整个分区（含 memtable 与 part 目录）。因为今天的分区满足 `day == today`，所以
+`-retention N` 实际保留 **N+1 个 UTC 日**（含今天）；例如 `-retention 30` 会保留
+今天以及之前 30 个 UTC 日，共 31 天。`retention_days = 0` 关闭过期删除。
 
 ### 5.3 启动恢复
 
@@ -227,7 +250,9 @@ timestamps: nrows * i64
   不完整的 part 目录会被删除。
 - 读取所有 `merged_from`，剔除已被取代的 part。
 - 从目录名恢复序号计数；新 flush/merge 不会复用已加载的序号。
-- 启动时不会重建 memtable：未 flush 的数据在进程退出时由 `store_close` 写入磁盘。
+- 启动时不会重建 memtable：未 flush 的数据需要调用 `store_close` 才会在退出路径
+  写入磁盘。CLI 的 `SIGINT`/`SIGTERM` 关停会执行该路径；`kill -9`、断电或第二次
+  信号（130/143）不会。
 
 ## 6. 缓存
 
@@ -265,8 +290,9 @@ timestamps: nrows * i64
   推导出的几何参数一致；每段数据都做长度上界检查。加载会丢弃已过期条目，重建 map
   与 FIFO，因此 `entries/bytes` 与保存时可能略有差异。
 - `-cache-file` 非空时启动加载；`-cache-save-interval > 0` 时后台线程按间隔保存
-  （`save_mu` 串行化所有保存），`server_run` 正常返回时再保存一次，`POST /cache/save`
-  可立即触发一次保存。进程被信号直接终止时不执行退出保存，此时以周期保存为准。
+  （`save_mu` 串行化所有保存），`server_run` 正常返回（含 `SIGINT`/`SIGTERM`
+  关停）时再保存一次，`POST /cache/save` 可立即触发一次保存。只有 `kill -9`、断电
+  或第二次信号会跳过退出保存，此时以周期保存为准。
 - 快照是一次全量拷贝，保存期间写操作继续；因此快照不保证跨桶的精确时间点一致，
   但每个桶内部的记录总是自洽的。
 
@@ -290,6 +316,10 @@ timestamps: nrows * i64
 - 支持 `Content-Length`、chunked、`Expect: 100-continue`、请求体 gzip 解压。
 - 上限：请求头 64 KiB、请求体 256 MiB、空闲读超时 60 s、发送超时 30 s；
   开启 `TCP_NODELAY`。响应带宽松 CORS 头和 `Server: oboe`。
+- 上限错误不静默断连：请求头超限回 `431`，`Content-Length` 声明或 chunked 累计
+  body 超限回 `413`，`Content-Length` 与 `Transfer-Encoding` 并存、非法 chunk
+  size/框架回 `400`；响应带 `Content-Length` 与 `Connection: close`，发送后关闭，
+  不再读取剩余 body。
 - `/health` 返回 `OK`，`/metrics` 输出 Prometheus 文本格式。
 
 ## 9. 并发不变量

@@ -15,7 +15,10 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import oboe "../src"
+import "../common"
+import "../logdb"
+import cachelib "../cache"
+import queuelib "../queue"
 
 Params :: struct {
 	mode:    string,
@@ -199,7 +202,7 @@ millis :: #force_inline proc(d: time.Duration) -> f64 {
 // ---------------------------------------------------------------- ingest
 
 Ingest_Args :: struct {
-	s:       ^oboe.Store,
+	s:       ^logdb.Store,
 	corpus:  ^Corpus,
 	start:   ^u32,
 	seq:     ^u64,
@@ -211,9 +214,9 @@ Ingest_Args :: struct {
 ingest_worker :: proc(data: rawptr) {
 	a := cast(^Ingest_Args)data
 	spin_until(a.start)
-	rows := make([]oboe.Ingest_Row, a.batch)
+	rows := make([]logdb.Ingest_Row, a.batch)
 	defer delete(rows)
-	fields := make([]oboe.Field, a.batch * 4)
+	fields := make([]logdb.Field, a.batch * 4)
 	defer delete(fields)
 	done := 0
 	for done < a.rows {
@@ -224,25 +227,25 @@ ingest_worker :: proc(data: rawptr) {
 			ts := a.base_ts + i64(seq) * 1_000
 			svc := int(gi % 4)
 			fi := b * 4
-			fields[fi+0] = oboe.Field{name = "level", value = a.corpus.levels[gi % 4]}
-			fields[fi+1] = oboe.Field{name = "service", value = a.corpus.services[svc]}
-			fields[fi+2] = oboe.Field{name = "duration", value = a.corpus.durations[gi % 256]}
-			fields[fi+3] = oboe.Field{name = "zone", value = a.corpus.zones[gi % 3]}
-			rows[b] = oboe.Ingest_Row{
+			fields[fi+0] = logdb.Field{name = "level", value = a.corpus.levels[gi % 4]}
+			fields[fi+1] = logdb.Field{name = "service", value = a.corpus.services[svc]}
+			fields[fi+2] = logdb.Field{name = "duration", value = a.corpus.durations[gi % 256]}
+			fields[fi+3] = logdb.Field{name = "zone", value = a.corpus.zones[gi % 3]}
+			rows[b] = logdb.Ingest_Row{
 				ts     = ts,
 				stream = u64(svc + 1),
 				msg    = a.corpus.msgs[gi % len(a.corpus.msgs)],
 				fields = fields[fi:fi+4],
 			}
 		}
-		oboe.store_ingest(a.s, rows[:count])
+		logdb.store_ingest(a.s, rows[:count])
 		done += count
 	}
 }
 
 // fill_store ingests `rows` rows with `threads` writers and returns the wall
 // time of the concurrent ingest phase.
-fill_store :: proc(s: ^oboe.Store, rows, threads, batch: int) -> time.Duration {
+fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int) -> time.Duration {
 	corpus := corpus_make()
 	defer corpus_destroy(&corpus)
 
@@ -284,26 +287,26 @@ run_ingest :: proc(p: Params) {
 	defer delete(dir)
 	os.remove_all(dir)
 
-	cfg := oboe.default_store_config()
+	cfg := logdb.default_store_config()
 	cfg.data_path = dir
 	// Keep everything in memory during the timed ingest, then flush once.
 	cfg.flush_interval = time.Duration(1 << 62)
 	cfg.flush_max_rows = 1 << 30
 	cfg.flush_max_bytes = 1 << 40
-	s := oboe.store_init(cfg, false)
-	defer oboe.store_close(s)
+	s := logdb.store_init(cfg, false)
+	defer logdb.store_close(s)
 
 	fmt.printf("[ingest] rows=%d threads=%d batch=%d\n", p.rows, p.threads, p.batch)
 	d := fill_store(s, p.rows, p.threads, p.batch)
 	fmt.printf("  ingest   %.0f rows/s  %.1f ms\n", throughput(p.rows, d), millis(d))
 
-	st := oboe.store_stats(s)
+	st := logdb.store_stats(s)
 	fmt.printf("  mem      %d rows in %d partitions\n", st.mem_rows, st.partitions)
 
 	begin := time.now()
-	oboe.store_flush_all(s)
+	logdb.store_flush_all(s)
 	fd := time.since(begin)
-	st = oboe.store_stats(s)
+	st = logdb.store_stats(s)
 	mib := f64(st.disk_bytes) / (1 << 20)
 	fmt.printf("  flush    %.0f rows/s  %.1f ms  %d parts  %.1f MiB on disk\n",
 		throughput(p.rows, fd), millis(fd), st.parts, mib)
@@ -312,7 +315,7 @@ run_ingest :: proc(p: Params) {
 // ---------------------------------------------------------------- query
 
 Query_Args :: struct {
-	s:      ^oboe.Store,
+	s:      ^logdb.Store,
 	start:  ^u32,
 	qstr:   string,
 	now:    i64,
@@ -323,18 +326,18 @@ Query_Args :: struct {
 
 query_worker :: proc(data: rawptr) {
 	a := cast(^Query_Args)data
-	q, ok := oboe.parse_query_string(a.qstr, a.now)
+	q, ok := logdb.parse_query_string(a.qstr, a.now)
 	if !ok {
 		sync.atomic_add(a.errors, 1)
 		return
 	}
 	spin_until(a.start)
 	for _ in 0..<a.reps {
-		r := oboe.execute_query(a.s, &q, 100)
+		r := logdb.execute_query(a.s, &q, 100)
 		sync.atomic_add(a.rows, u64(len(r.rows)))
-		oboe.result_destroy(&r)
+		logdb.result_destroy(&r)
 	}
-	oboe.query_destroy(&q)
+	logdb.query_destroy(&q)
 }
 
 run_query :: proc(p: Params) {
@@ -342,16 +345,16 @@ run_query :: proc(p: Params) {
 	defer delete(dir)
 	os.remove_all(dir)
 
-	cfg := oboe.default_store_config()
+	cfg := logdb.default_store_config()
 	cfg.data_path = dir
 	cfg.flush_interval = time.Duration(1 << 62)
 	cfg.flush_max_rows = 1 << 30
 	cfg.flush_max_bytes = 1 << 40
-	s := oboe.store_init(cfg, false)
-	defer oboe.store_close(s)
+	s := logdb.store_init(cfg, false)
+	defer logdb.store_close(s)
 
 	fill_store(s, p.rows, p.threads, p.batch)
-	oboe.store_flush_all(s)
+	logdb.store_flush_all(s)
 	now := time.to_unix_nanoseconds(time.now())
 
 	qstrs := []string{
@@ -403,7 +406,7 @@ run_query :: proc(p: Params) {
 CACHE_KEYS :: 8192
 
 Cache_Args :: struct {
-	c:     ^oboe.Cache,
+	c:     ^cachelib.Cache,
 	start: ^u32,
 	keys:  []string,
 	value: []u8,
@@ -414,20 +417,20 @@ Cache_Args :: struct {
 
 cache_worker :: proc(data: rawptr) {
 	a := cast(^Cache_Args)data
-	buf := oboe.buf_init(256)
-	defer oboe.buf_destroy(&buf)
+	buf := common.buf_init(256)
+	defer common.buf_destroy(&buf)
 	spin_until(a.start)
 	ki := a.idx % len(a.keys)
 	for i in 0..<a.ops {
 		k := a.keys[ki]
 		if i % 10 == 0 {
-			oboe.cache_set(a.c, k, a.value, 0)
+			cachelib.cache_set(a.c, k, a.value, 0)
 		} else {
-			oboe.buf_reset(&buf)
-			oboe.cache_get_into(a.c, k, &buf)
+			common.buf_reset(&buf)
+			cachelib.cache_get_into(a.c, k, &buf)
 		}
 		if i % 97 == 0 {
-			oboe.cache_delete(a.c, k)
+			cachelib.cache_delete(a.c, k)
 		}
 		ki += 1
 		if ki == len(a.keys) {
@@ -438,11 +441,11 @@ cache_worker :: proc(data: rawptr) {
 }
 
 run_cache :: proc(p: Params) {
-	cfg := oboe.default_cache_config()
+	cfg := cachelib.default_cache_config()
 	cfg.max_bytes = 0
 	cfg.max_entries = 0
-	c := oboe.cache_init(cfg)
-	defer oboe.cache_destroy(c)
+	c := cachelib.cache_init(cfg)
+	defer cachelib.cache_destroy(c)
 
 	keys := make([]string, CACHE_KEYS)
 	defer {
@@ -461,7 +464,7 @@ run_cache :: proc(p: Params) {
 	}
 	// Prefill so the measured mix is dominated by the read path.
 	for k in keys {
-		oboe.cache_set(c, k, value, 0)
+		cachelib.cache_set(c, k, value, 0)
 	}
 
 	start: u32
@@ -491,7 +494,7 @@ run_cache :: proc(p: Params) {
 	wait_workers(workers)
 	d := time.since(begin)
 
-	st := oboe.cache_stats(c)
+	st := cachelib.cache_stats(c)
 	fmt.printf("  cache    %.0f ops/s  %.1f ms  entries=%d hits=%d misses=%d sets=%d deletes=%d\n",
 		throughput(total_ops, d), millis(d), st.entries, st.hits, st.misses, st.sets, st.deletes)
 }
@@ -499,7 +502,7 @@ run_cache :: proc(p: Params) {
 // ---------------------------------------------------------------- queue
 
 Queue_Prod_Args :: struct {
-	q:      ^oboe.Queue,
+	q:      ^queuelib.Queue,
 	start:  ^u32,
 	body:   []u8,
 	jobs:   int,
@@ -511,7 +514,7 @@ queue_producer :: proc(data: rawptr) {
 	a := cast(^Queue_Prod_Args)data
 	spin_until(a.start)
 	for _ in 0..<a.jobs {
-		_, res := oboe.queue_put(a.q, "bench", 0, 0, i64(30_000_000_000), a.body)
+		_, res := queuelib.queue_put(a.q, "bench", 0, 0, i64(30_000_000_000), a.body)
 		if res == .OK {
 			sync.atomic_add(a.put_ok, 1)
 		} else {
@@ -521,7 +524,7 @@ queue_producer :: proc(data: rawptr) {
 }
 
 Queue_Cons_Args :: struct {
-	q:        ^oboe.Queue,
+	q:        ^queuelib.Queue,
 	start:    ^u32,
 	total:    int,
 	consumed: ^u64,
@@ -529,30 +532,30 @@ Queue_Cons_Args :: struct {
 
 queue_consumer :: proc(data: rawptr) {
 	a := cast(^Queue_Cons_Args)data
-	conn := oboe.queue_new_conn(a.q)
-	oboe.queue_conn_opened(a.q)
+	conn := queuelib.queue_new_conn(a.q)
+	queuelib.queue_conn_opened(a.q)
 	watched := []string{"bench"}
-	buf := oboe.buf_init(256)
-	defer oboe.buf_destroy(&buf)
+	buf := common.buf_init(256)
+	defer common.buf_destroy(&buf)
 	empty := make([]u64, 0)
 	defer delete(empty)
-	defer oboe.queue_conn_closed(a.q, "bench", watched, empty)
+	defer queuelib.queue_conn_closed(a.q, "bench", watched, empty)
 
 	spin_until(a.start)
 	for sync.atomic_load(a.consumed) < u64(a.total) {
-		id, ok := oboe.queue_reserve_into(a.q, watched, conn, i64(50_000_000), &buf)
+		id, ok := queuelib.queue_reserve_into(a.q, watched, conn, i64(50_000_000), &buf)
 		if ok {
-			oboe.queue_delete(a.q, id, conn)
+			queuelib.queue_delete(a.q, id, conn)
 			sync.atomic_add(a.consumed, 1)
 		}
 	}
 }
 
 run_queue :: proc(p: Params) {
-	cfg := oboe.default_queue_config()
+	cfg := queuelib.default_queue_config()
 	cfg.max_jobs = p.rows + 1024
-	q := oboe.queue_init(cfg)
-	defer oboe.queue_destroy(q)
+	q := queuelib.queue_init(cfg)
+	defer queuelib.queue_destroy(q)
 
 	producers := max(1, p.threads / 2)
 	consumers := max(1, p.threads - producers)
@@ -612,7 +615,7 @@ run_queue :: proc(p: Params) {
 	wait_workers(cons_workers)
 	d := time.since(begin)
 
-	st := oboe.queue_stats(q)
+	st := queuelib.queue_stats(q)
 	fmt.printf("  queue    %.0f jobs/s  %.1f ms  put=%d consumed=%d failed=%d ready=%d reserved=%d\n",
 		throughput(int(consumed), d), millis(d), put_ok, consumed, failed,
 		st.ready, st.reserved)

@@ -1,21 +1,30 @@
 # 以库形式使用 oboe
 
-`src/` 是一个完整的 Odin 包（`package oboe`），日志存储/查询、缓存、任务队列和
-HTTP 服务器都可以脱离命令行单独使用。`src/main.odin` 只是附带的可执行入口：导入
-该包时其中的 `main` 过程不会被调用。
+源码拆成多个 Odin 包（`common`、`netio`、`logdb`、`cache`、`queue`、`web`），包布局与
+依赖方向见 [模块与包布局](modules.md)。日志存储/查询、缓存、任务队列和 HTTP 服务器
+都可以脱离命令行单独使用。`cmd/` 是唯一可执行入口（`package main`，只做装配与关停），
+库包本身不包含 `main`。
 
-示例程序见 [`examples/embed/main.odin`](../examples/embed/main.odin)：
+可运行示例：
 
 ```bash
-odin run examples/embed
+odin run examples/embed # store + query + cache + queue
+odin run examples/logs  # 写入 + LogsQL 查询
+odin run examples/cache # TTL、get_into、快照
+odin run examples/queue # put/reserve/delete + 断线回收
 ```
 
 ## 1. 引入
 
-最直接的方式是把仓库作为子模块或直接拷贝到项目里，然后使用相对路径导入：
+最直接的方式是把仓库作为子模块或直接拷贝到项目里，然后按需使用相对路径导入：
 
 ```odin
-import oboe "../../third_party/oboe/src"
+import "../../third_party/oboe/common" // 包名 common
+import "../../third_party/oboe/netio"  // 单独使用 TCP 行读取时
+import "../../third_party/oboe/logdb"  // 包名 logdb
+import "../../third_party/oboe/cache"
+import "../../third_party/oboe/queue"
+import "../../third_party/oboe/web"
 ```
 
 也可以使用 Odin 的 collection，避免依赖相对层级：
@@ -25,12 +34,18 @@ odin build . -collection:oboe=/path/to/oboe
 ```
 
 ```odin
-import oboe "oboe:src"
+import "oboe:common"
+import "oboe:netio"
+import "oboe:logdb"
+import "oboe:cache"
+import "oboe:queue"
+import "oboe:web"
 ```
 
-包目录名是 `src`，默认标识符会变成 `src`，因此请显式起别名 `oboe`。不要使用
-`import . "..."` 点导入，否则 `oboe.main` 会与你自己程序的 `main` 重名（普通别名
-导入不会冲突）。
+包名与目录名一致（`common`、`logdb`、`cache`、`queue`、`web`、`netio`）。如果局部
+变量与包名同名（例如 `cache` / `queue`），请给 import 起别名，例如
+`import cachelib "oboe:cache"`。不要使用 `import . "..."` 点导入，否则包内符号会
+与你自己程序的标识符冲突。
 
 ## 2. 组件速查
 
@@ -46,7 +61,9 @@ import oboe "oboe:src"
 所有配置都可以从 `default_*_config()` 开始改，例如：
 
 ```odin
-cfg := oboe.default_store_config()
+import "oboe:logdb"
+
+cfg := logdb.default_store_config()
 cfg.data_path = "/var/lib/oboe"
 cfg.stream_fields = []string{"level", "service"}
 ```
@@ -54,47 +71,51 @@ cfg.stream_fields = []string{"level", "service"}
 ## 3. 存储与 LogsQL 查询
 
 ```odin
-cfg := oboe.default_store_config()
+import "oboe:logdb"
+import "oboe:common"
+import "core:fmt"
+
+cfg := logdb.default_store_config()
 cfg.data_path = "/tmp/oboe_embed"
 cfg.stream_fields = []string{"level", "service"}
 cfg.flush_interval = 1 << 62 // 示例里手动 flush；实际使用保留默认 1s
 
-s := oboe.store_init(cfg, false) // false = 不启动后台 flush/merge 线程
-defer oboe.store_close(s)
+s := logdb.store_init(cfg, false) // false = 不启动后台 flush/merge 线程
+defer logdb.store_close(s)
 
-arena: oboe.Arena
-defer oboe.arena_destroy(&arena)
+arena: common.Arena
+defer common.arena_destroy(&arena)
 
-parsed: oboe.Parsed_Line
+parsed: logdb.Parsed_Line
 line := `{"_time":"2026-10-26T10:00:00Z","level":"error","service":"api","_msg":"boom"}`
-oboe.parse_json_line(line, &arena, "_msg", "_time", &parsed)
-ts, _ := oboe.parse_iso_ns(parsed.time_raw)
+logdb.parse_json_line(line, &arena, "_msg", "_time", &parsed)
+ts, _ := common.parse_iso_ns(parsed.time_raw)
 
-fields := make([]oboe.Field, parsed.nfields)
+fields := make([]logdb.Field, parsed.nfields)
 defer delete(fields)
 copy(fields, parsed.fields[:parsed.nfields])
 
-rows := [1]oboe.Ingest_Row{{
+rows := [1]logdb.Ingest_Row{{
 	ts     = ts,
-	stream = oboe.compute_stream_id(fields, cfg.stream_fields),
+	stream = logdb.compute_stream_id(fields, cfg.stream_fields),
 	msg    = parsed.msg,
 	fields = fields,
 }}
-oboe.store_ingest(s, rows[:])
-oboe.store_flush_all(s)
+logdb.store_ingest(s, rows[:])
+logdb.store_flush_all(s)
 
-q, ok := oboe.parse_query_string("level:error | limit 10", oboe.now_ns())
+q, ok := logdb.parse_query_string("level:error | limit 10", common.now_ns())
 if !ok {
 	// 查询语法错误
 	return
 }
-defer oboe.query_destroy(&q)
+defer logdb.query_destroy(&q)
 
-res := oboe.execute_query(s, &q, 100)
-defer oboe.result_destroy(&res)
+res := logdb.execute_query(s, &q, 100)
+defer logdb.result_destroy(&res)
 for i in 0..<len(res.rows) {
 	row := &res.rows[i]
-	service, _ := oboe.out_row_get(row, "service")
+	service, _ := logdb.out_row_get(row, "service")
 	fmt.println(row.msg, service)
 }
 ```
@@ -116,22 +137,27 @@ for i in 0..<len(res.rows) {
 默认就是纯内存缓存；不调用快照相关函数时不会产生任何文件 I/O。
 
 ```odin
-cfg := oboe.default_cache_config()
+import "oboe:cache"
+import "oboe:common"
+import "core:fmt"
+import "core:time"
+
+cfg := cache.default_cache_config()
 cfg.max_bytes = 64 << 20
 cfg.max_entries = 100_000
 
-c := oboe.cache_init(cfg)
-defer oboe.cache_destroy(c)
+c := cache.cache_init(cfg)
+defer cache.cache_destroy(c)
 
-oboe.cache_set(c, "greeting", transmute([]u8)string("hello"), i64(30 * time.Second))
+cache.cache_set(c, "greeting", transmute([]u8)string("hello"), i64(30 * time.Second))
 
-out := oboe.buf_init(64)
-defer oboe.buf_destroy(&out)
-if oboe.cache_get_into(c, "greeting", &out) {
+out := common.buf_init(64)
+defer common.buf_destroy(&out)
+if cache.cache_get_into(c, "greeting", &out) {
 	fmt.println(string(out.data[:]))
 }
 
-st := oboe.cache_stats(c) // entries/bytes/hits/.../collisions
+st := cache.cache_stats(c) // entries/bytes/hits/.../collisions
 ```
 
 - `ttl_ns > 0` 设置过期时间，`0` 表示不过期；过期项在读取或 `cache_stats` 时清理。
@@ -147,30 +173,36 @@ st := oboe.cache_stats(c) // entries/bytes/hits/.../collisions
 只有显式调用以下 API 时才落盘（目标目录需要已存在）：
 
 ```odin
+import "oboe:cache"
+import "core:fmt"
+import "core:os"
+
 os.make_directory_all("/tmp/oboe_cache")
-if bytes, ok := oboe.cache_save_file(c, "/tmp/oboe_cache/cache.bin"); ok {
+if bytes, ok := cache.cache_save_file(c, "/tmp/oboe_cache/cache.bin"); ok {
 	fmt.printfln("saved %d bytes", bytes)
 }
 
-loaded, ok := oboe.cache_load_file(cfg, "/tmp/oboe_cache/cache.bin")
+loaded, ok := cache.cache_load_file(cfg, "/tmp/oboe_cache/cache.bin")
 if ok {
-	defer oboe.cache_destroy(loaded)
+	defer cache.cache_destroy(loaded)
 }
 ```
 
-- `cache_load_file` 会用 `cfg` 重新推导桶几何参数，并要求与文件头一致；配置改变后
-  旧文件会被拒绝加载。加载会丢弃已过期条目。
+- `cache_load_file` 会用 `cfg` 重新推导桶几何参数，并要求文件头里的
+  `bucket_count` / `max_chunks` 与当前配置一致；改变桶数或每桶 chunk 数的配置
+  （例如大幅调整 `-cache-size`，或把 `-cache-max-entries` 调到足以改变桶数的低值）
+  会拒绝加载旧文件，其他参数变化通常不影响。加载会丢弃已过期条目。
 - 保存是 `tmp + rename` 原子替换，每桶独立 zlib 压缩；保存期间缓存仍可读写，但跨桶
   不保证精确同一时刻。
 - 需要周期性保存时，可以复用 CLI 同样的机制（`Cache_Saver` + `cache_saver_run`）：
 
 ```odin
-saver := oboe.Cache_Saver{
+saver := cache.Cache_Saver{
 	c        = c,
 	path     = "/tmp/oboe_cache/cache.bin", // 需在 saver 存活期间保持有效
 	interval = time.Minute,
 }
-t := thread.create_and_start_with_data(&saver, oboe.cache_saver_run, self_cleanup = false)
+t := thread.create_and_start_with_data(&saver, cache.cache_saver_run, self_cleanup = false)
 defer {
 	sync.atomic_store(&saver.stop, 1)
 	thread.join(t)
@@ -180,46 +212,71 @@ defer {
 
 （需要 `core:thread`、`core:sync`、`core:time`。）
 
-- 进程被信号直接杀死时不会执行退出保存；依赖周期保存或自行在退出路径调用
-  `cache_save_file`。HTTP 服务还提供 `POST /cache/save`（需设置 `srv.cache_file`）。
+- 库本身不安装信号处理器；宿主进程被 `SIGINT`/`SIGTERM` 直接杀死时不会执行退出
+  保存。`cmd/main.odin` 已在 CLI 层处理信号；嵌入使用时请自行在退出路径调用
+  `cache_save_file`，或依赖周期保存（`Cache_Saver`）/`POST /cache/save`。
 
 ## 5. 任务队列
 
 `queue_init` 会启动一个后台线程推进延迟 job 和 TTR 超时，`queue_destroy` 会 join 它。
 
 ```odin
-q := oboe.queue_init(oboe.default_queue_config())
-defer oboe.queue_destroy(q)
+import "oboe:queue"
+import "oboe:common"
+import "core:fmt"
+import "core:time"
 
-id, res := oboe.queue_put(q, "default", 0, 0, i64(30 * time.Second), transmute([]u8)string("body"))
+q := queue.queue_init(queue.default_queue_config())
+defer queue.queue_destroy(q)
 
-conn := oboe.queue_new_conn(q)
-body := oboe.buf_init(64)
-defer oboe.buf_destroy(&body)
-if job, ok := oboe.queue_reserve_into(q, []string{"default"}, conn, 0, &body); ok {
-	fmt.println(job, string(body.data[:]))
-	oboe.queue_delete(q, job, conn)
+id, res := queue.queue_put(q, "default", 0, 0, i64(30 * time.Second), transmute([]u8)string("body"))
+fmt.println("put:", id, res)
+
+if !queue.queue_conn_opened(q) {
+	// max_conns 已满（默认 1024）
+	return
 }
-oboe.queue_conn_closed(q, "default", nil, nil)
+conn := queue.queue_new_conn(q)
+
+body := common.buf_init(64)
+defer common.buf_destroy(&body)
+
+reserved: [dynamic]u64
+defer delete(reserved)
+
+if job, ok := queue.queue_reserve_into(q, []string{"default"}, conn, 0, &body); ok {
+	fmt.println(job, string(body.data[:]))
+	append(&reserved, job) // 自行记录该连接持有中的 id
+	queue.queue_delete(q, job, conn)
+}
+// queue_conn_closed 只回收显式传入的 reserved 列表：已 delete 的 id 不在
+// RESERVED 状态会被跳过；若 worker 在 delete 前退出，列表里的 job 回到 ready。
+queue.queue_conn_closed(q, "default", nil, reserved[:])
 ```
 
 - `queue_put` 的 `delay_ns` / `ttr_ns` 均为纳秒；`timeout_ns = 0` 时 reserve 不阻塞。
-- `queue_conn_opened` / `queue_use` / `queue_watch` / `queue_conn_closed` 用于模拟
-  beanstalkd 客户端状态；只做内存队列时可以省略，但断线回收依赖
-  `queue_conn_closed` 把该连接的 reserved job 放回 ready。
+- `queue_conn_opened` / `queue_use` / `queue_watch` / `queue_conn_closed` 维护
+  beanstalkd 风格的连接统计。只做内存队列时可以省略这些调用，但**断线回收不是
+  自动的**：`queue_conn_closed` 只把 `reserved: []u64` 里仍处于 `RESERVED` 的 job
+  放回 ready。TCP 服务端为每个连接维护自己的 reserved 列表（`queue/queue_server.odin`
+  的 `QConn.reserved`）；自行嵌入时也要自己记录 reserve 过的 id，`used` / `watched`
+  仅用于扣减统计计数。
 - 队列只存内存，无持久化与复制；`queue_stats` / `queue_tube_stats` / `queue_job_stats`
   返回同样的统计结构。
 
 ## 6. HTTP 服务器
 
 ```odin
-srv := oboe.server_init(oboe.default_server_config(), s, c, q)
+import "oboe:web"
+import "core:os"
+
+srv := web.server_init(web.default_server_config(), s, c, q)
 srv.cache_file = "/tmp/oboe_cache/cache.bin" // 可选：启用 POST /cache/save
-if !oboe.server_run(srv) {
-	oboe.server_destroy(srv)
+if !web.server_run(srv) {
+	web.server_destroy(srv)
 	os.exit(1)
 }
-oboe.server_destroy(srv) // server_run 返回后释放
+web.server_destroy(srv) // server_run 返回后释放
 ```
 
 - `server_run` 阻塞，内部创建 worker 线程；从其他线程调用 `server_stop(srv)` 可以
@@ -227,16 +284,20 @@ oboe.server_destroy(srv) // server_run 返回后释放
   的连接并释放 `Server` 本身；对未启动或已停止的 server 也可安全调用。
 - `cache` 和 `queue` 参数可以为 `nil`，对应 API 会返回 503。
 - 不需要真实端口时，可以直接调用 `dispatch(srv, &req, &arena)` 处理构造好的
-  `Http_Request`；测试就是这样做的（见 `src/handlers_test.odin`）。
-- 服务器不安装信号处理器；需要在收到 SIGINT/SIGTERM 时优雅退出，请在宿主程序中
-  自行处理并调用 `server_stop`，再释放各组件与缓存快照。
+  `Http_Request`；测试就是这样做的（见 `web/handlers_test.odin`）。
+- 服务器不安装信号处理器；`SIGINT`/`SIGTERM` 默认直接终止进程，`defer` 不会执行。
+  `cmd/main.odin` 在 CLI 层捕获信号并完成优雅关停（见 [运维](cookbook/operations.md)
+  的「关停」）。嵌入使用时请在宿主程序中自行处理：信号处理器里只做原子置位并调用
+  `server_request_stop(srv)`（异步信号安全，不 join 线程），然后在主线程调用
+  `server_stop(srv)` join worker，再依次停止保存线程、`store_close`（flush
+  memtable）、`cache_save_file`（如需快照），最后销毁各组件。
 
 ## 7. 内存所有权一览
 
 | 数据 | 由谁释放 |
 | --- | --- |
 | `store_ingest` 的入参 | 调用方；store 会拷贝 |
-| `parse_json_line` 产生的字符串 | 传入的 `Arena`，用 `arena_reset`/`arena_destroy` 释放 |
+| `parse_json_line` 产生的字符串 | 未转义部分是输入字符串的视图；转义部分在传入的 `Arena` |
 | `Query` | `query_destroy` |
 | `Query_Result` | `result_destroy` |
 | `cache_get` 的返回值 | 调用方 `delete` |
@@ -255,7 +316,8 @@ oboe.server_destroy(srv) // server_run 返回后释放
 
 ## 9. 注意事项
 
-- `src/main.odin` 与 CLI 参数解析也在库包内，但只有构建可执行文件时才会被执行。
+- `cmd/main.odin` 是可执行入口（`package main`），不能也不应被库使用者导入；库包
+  本身不含 `main`。
 - 缓存快照格式带版本号与几何参数校验，升级/改配置后旧文件可能无法加载。
 - 缓存 `cache_stats` 需要扫描有效条目（O(entries)），不要在高频路径反复调用。
 - 队列与缓存默认都只驻留内存；缓存快照是可选能力，队列没有持久化。

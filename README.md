@@ -7,15 +7,22 @@
 - beanstalkd 兼容的内存任务队列（TCP 协议）
 
 单个二进制同时提供日志写入/查询、Web UI、Prometheus 指标、缓存和队列服务。
-`src/` 同时是一个完整的 Odin 包，各组件可以按需嵌入其他程序（见
-[库用法](docs/library.md)）。
+源码按职责拆成多个 Odin 包（`common`、`netio`、`logdb`、`cache`、`queue`、`web`），
+`cmd/` 是唯一可执行入口；布局、职责和依赖方向见 [模块与包布局](docs/modules.md)，
+各组件可以按需嵌入其他程序（见 [库用法](docs/library.md)）。
 
-更多文档：[架构说明](docs/architecture.md) · [测试指南](docs/testing.md) · [库用法](docs/library.md)。
+更多文档：[模块与包布局](docs/modules.md) · [架构说明](docs/architecture.md) ·
+[测试指南](docs/testing.md) · [库用法](docs/library.md) · [贡献指南](CONTRIBUTING.md)。
+
+操作手册（cookbook）：[日志写入](docs/cookbook/logs-ingest.md) ·
+[LogsQL 查询](docs/cookbook/logsql.md) · [HTTP API](docs/cookbook/http-api.md) ·
+[缓存](docs/cookbook/cache.md) · [任务队列](docs/cookbook/queue.md) ·
+[嵌入到程序](docs/cookbook/embedding.md) · [运维](docs/cookbook/operations.md)。
 
 ## 快速开始
 
 ```bash
-odin build src -out:oboe
+odin build cmd -out:oboe
 ./oboe -data ./data
 ```
 
@@ -44,26 +51,42 @@ curl 'http://127.0.0.1:9428/select/logsql/query?query=*%20%7C%20stats%20by%20(se
 
 ## 作为库使用
 
-`src/` 是单包 `oboe`，可直接导入其他程序；`src/main.odin` 只在构建可执行文件时生效。
+源码是多个独立包，按需导入：`common`（缓冲区、时间/大小解析、zlib 包装）、
+`netio`（TCP 行读取与监听地址解析）、`logdb`（存储与 LogsQL）、`cache`、`queue`、
+`web`（HTTP 服务与 UI）。`cmd/` 是唯一可执行入口；包间依赖见
+[模块与包布局](docs/modules.md)。
 
 ```odin
-import oboe "../oboe/src" // 按实际路径调整
+import "../oboe/common"  // 包名 common
+import "../oboe/logdb"   // 包名 logdb
+import cachelib "../oboe/cache"
+import queuelib "../oboe/queue"
+import "../oboe/web"     // 需要 HTTP 服务时
+// netio 通常由 web/queue 间接使用；单独读取 TCP 行时再导入。
 
-cfg := oboe.default_cache_config()
-c := oboe.cache_init(cfg)
-defer oboe.cache_destroy(c)
-oboe.cache_set(c, "k", transmute([]u8)string("v"), 0)
+cfg := cachelib.default_cache_config()
+c := cachelib.cache_init(cfg)
+defer cachelib.cache_destroy(c)
+cachelib.cache_set(c, "k", transmute([]u8)string("v"), 0)
 ```
+
+仓库外使用 collection 可以写成 `import "oboe:cache"`（构建时加
+`-collection:oboe=/path/to/oboe`）。变量名与包名冲突时用别名（如 `cachelib`），
+不要用 `import . "..."` 点导入。上面的多包导入是示意，实际代码只保留用到的 import
+（Odin 会拒绝未使用的导入）。
 
 - 缓存默认纯内存；`cache_save_file` / `cache_load_file` 是可选快照能力。
 - 存储 + LogsQL 查询、缓存、队列的完整示例见
   [`examples/embed/main.odin`](examples/embed/main.odin)。
 - 导入方式、组件生命周期、内存所有权与并发约定见 [库用法](docs/library.md)。
 
-运行示例：
+运行示例（每个示例使用独立的 `/tmp` 目录，退出前自动清理）：
 
 ```bash
-odin run examples/embed
+odin run examples/logs   # 写入 + LogsQL 查询，不占端口
+odin run examples/cache  # TTL、get_into、快照保存/加载
+odin run examples/queue  # put/reserve/delete + 断线回收
+odin run examples/embed  # store/cache/queue 组合示例
 ```
 
 ## 命令行参数
@@ -73,7 +96,7 @@ odin run examples/embed
 | `-data` | `./data` | 数据目录 |
 | `-listen` | `0.0.0.0:9428` | HTTP 监听地址 |
 | `-workers` | `8` | HTTP 工作线程数 |
-| `-retention` | `30` | 保留天数，`0` 表示永久 |
+| `-retention` | `30` | 保留天数；实际保留 N+1 个 UTC 日（含今天），`0` 表示永久 |
 | `-block-rows` | `8192` | 每个存储块的行数 |
 | `-merge-threshold` | `8` | 分区内 part 数达到该值时合并 |
 | `-stream-fields` | `level,service` | 构成 stream 的字段，逗号分隔 |
@@ -81,7 +104,7 @@ odin run examples/embed
 | `-cache-size` | `256MB` | 缓存容量，支持 `KB/KiB/MB/MiB/GB/GiB`，`0` 为不限 |
 | `-cache-max-entries` | `1000000` | 缓存 key 数量上限（近似，按桶均分），`0` 为不限 |
 | `-cache-max-value` | `16MB` | 单个 value 大小上限 |
-| `-cache-file` | - | 缓存快照文件；设置后启动时加载，退出时保存 |
+| `-cache-file` | - | 缓存快照文件；设置后启动时加载，正常关停（含 SIGINT/SIGTERM）时保存 |
 | `-cache-save-interval` | `1m` | 周期保存间隔；`0` 表示不做周期保存（仍可用 `POST /cache/save`） |
 | `-no-cache` | - | 关闭缓存 |
 | `-queue-listen` | `127.0.0.1:11300` | 队列监听地址；`off` 或空串关闭 |
@@ -121,7 +144,8 @@ data/
 - 每个 part 不可变；满足 `merge-threshold` 后做 k 路归并，合并结果写完并落盘后才替换旧 part。
 - 启动时从 `p_<16位十六进制>` 目录名恢复 part 序号，读取 `merged_from` 去重，
   避免重启后序号复用导致的覆盖写入或重复计数。
-- 保留策略按天删除过期分区。
+- 保留策略按天删除过期分区：删除 `day < 今天(UTC) - N` 的分区，因此 `-retention N`
+  实际保留 N+1 个 UTC 日（含今天）。
 
 ## LogsQL 子集
 
@@ -157,7 +181,7 @@ HTTP 查询参数：`query`、`limit`、`start`、`end`。
 | `GET` | `/select/logsql/query` | 查询，NDJSON |
 | `GET` | `/select/logsql/field_names` | 字段名及出现次数 |
 | `GET` | `/select/logsql/field_values` | 字段值及出现次数 |
-| `GET/PUT/DELETE` | `/cache/<key>` | 缓存读写删 |
+| `GET/PUT/POST/DELETE` | `/cache/<key>` | 缓存读写删 |
 | `GET` | `/cache/stats` | 缓存统计 |
 | `POST` | `/cache/save` | 立即保存到 `-cache-file` |
 | `GET` | `/metrics` | Prometheus 指标 |
@@ -166,6 +190,10 @@ HTTP 查询参数：`query`、`limit`、`start`、`end`。
 
 写入参数：`_time_field`、`_msg_field`、`_stream_fields`。
 查询参数：`query`、`limit`、`start`、`end`。
+
+请求头上限 64 KiB、请求体上限 256 MiB。超限分别返回 `431` / `413`；`Content-Length`
+与 `Transfer-Encoding` 并存或 chunk 框架损坏返回 `400`。这些响应带 `Content-Length`
+和 `Connection: close`，发送后关闭连接且不再读取剩余 body。
 
 ### 缓存 API
 
@@ -183,6 +211,24 @@ curl -X POST http://127.0.0.1:9428/cache/save   # 需要 -cache-file
 
 `stats` 与 `save` 是保留路径，不能作为普通 key 使用。
 
+### 关闭与持久化行为
+
+`cmd/main.odin` 安装 `SIGINT` / `SIGTERM` 处理器，第一次信号只设置原子停止标志并关闭
+监听套接字（不打印日志、不分配内存、不 join 线程）。`server_run` 返回后主线程执行
+完整 defer 链：
+
+- 停止接受新连接，并 half-close 活跃连接（空闲的 keep-alive 也会立即返回）；
+- 停止 `Cache_Saver` 周期保存线程，停止并销毁队列服务；
+- 保存 `-cache-file` 快照（如果设置了该参数），销毁缓存；
+- `store_close` flush 全部 memtable，并退出 merge/retention 线程；
+- 以退出码 0 退出。
+
+关停过程中第二次收到信号会立即以 130（`SIGINT`）/ 143（`SIGTERM`）退出，不再等待。
+只有 `kill -9`、断电或第二次信号会跳过 defer：最近一个 `-flush-interval` 周期内的
+memtable 和最近一次保存之后的缓存变更可能丢失。`-cache-file` 的退出保存不再依赖
+`-cache-save-interval` 的周期保存。停机备份步骤见
+[运维手册](docs/cookbook/operations.md) 的「关停」与「备份与恢复」一节。
+
 实现要点（参照 [fastcache](https://github.com/VictoriaMetrics/fastcache)）：
 
 - 512 个桶（配置很小时自动减少），桶内按 64 KiB chunk 环形复用，内存按需分配；
@@ -194,8 +240,9 @@ curl -X POST http://127.0.0.1:9428/cache/save   # 需要 -cache-file
 - `-cache-size` 按桶均分；`-cache-max-entries` 按桶均分后近似生效。
 - TTL 为绝对纳秒时间戳；读取时惰性清理过期项并计入 `expirations`。
 - 设置 `-cache-file` 后：启动时加载快照（校验格式、几何参数，丢弃已过期项），
-  后台按 `-cache-save-interval` 周期保存，进程正常返回时再保存一次；写临时文件后
-  rename 保证原子性，每个桶单独 zlib 压缩。被信号直接终止时不会执行退出保存。
+  后台按 `-cache-save-interval` 周期保存，进程正常返回（包括 `SIGINT`/`SIGTERM`
+  关停）时再保存一次；写临时文件后 rename 保证原子性，每个桶单独 zlib 压缩。
+  只有 `kill -9`、断电或第二次信号会跳过退出保存。
 - 值以副本存储，读取返回独立副本，避免调用方释放后悬垂。
 - `/metrics` 暴露 `oboe_cache_entries/bytes/hits_total/misses_total/evictions_total/expirations_total/collisions_total`，
   `/cache/stats` 额外返回 `buckets`。
@@ -241,19 +288,21 @@ printf 'put 0 0 60 5\r\nhello\r\nreserve-with-timeout 1\r\n' | nc 127.0.0.1 1130
 需要 Odin `dev-2026-10` 或更新版本。
 
 ```bash
-odin build src -out:oboe
-odin test src                        # 45 个用例
-odin test src -define:ODIN_STRESS=1  # 追加 4 个并发压力用例
+odin build cmd -out:oboe
+odin test tests -all-packages
+odin test tests -all-packages -define:ODIN_STRESS=1  # 追加并发压力用例
 ```
 
 测试覆盖工具函数（大小/时长/时间解析、缓冲区与编码）、zlib/gzip 压缩、JSON 行解析、
 bloom filter、块编解码、存储落盘与合并后重启一致性、LogsQL 解析与执行、HTTP 路由与
 三种写入协议、缓存 TTL/容量/大值/桶淘汰/保存加载/并发、队列优先级/延迟/TTR/bury/kick/
-pause/断线回收，共 45 个用例且无内存泄漏；`-define:ODIN_STRESS=1` 另加存储（并发写入
-+ 并发 flush/merge + 并发查询）、缓存并发读写、缓存边写边保存、队列的并发压力用例。
-详见 [测试指南](docs/testing.md)。
+pause/断线回收；`-define:ODIN_STRESS=1` 另加存储（并发写入 + 并发 flush/merge + 并发
+查询）、缓存并发读写、缓存边写边保存、队列的并发压力用例。用例数量与分布见
+[测试指南](docs/testing.md)。
 
 测试使用 `/tmp/oboe_*` 作为临时目录，结束后自动清理；可与现有数据目录并存。
+提交前可运行 `scripts/ci.sh`（构建、默认/压力测试、bench 与 embed 示例）；细节见
+[贡献指南](CONTRIBUTING.md)。
 
 ## 基准测试
 
