@@ -12,9 +12,26 @@ Conn :: struct {
 	buf:   [1 << 16]u8,
 	start: int,
 	end:   int,
+	// src switches the connection into buffered mode: bytes are pulled from the
+	// pre-filled slice instead of the socket. The HTTP worker uses this to run
+	// the blocking parser over a request the event loop already received in
+	// full, so the parser never touches the network.
+	src:   []u8,
+	pos:   int,
 }
 
 conn_fill :: proc(c: ^Conn) -> bool {
+	if c.src != nil {
+		if c.pos >= len(c.src) {
+			return false
+		}
+		n := min(len(c.buf), len(c.src) - c.pos)
+		copy(c.buf[:n], c.src[c.pos:c.pos+n])
+		c.pos += n
+		c.start = 0
+		c.end = n
+		return true
+	}
 	n, err := net.recv_tcp(c.sock, c.buf[:])
 	if err != nil || n <= 0 {
 		return false

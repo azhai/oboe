@@ -437,3 +437,52 @@ test_http_e2e_stop_releases_port :: proc(t: ^testing.T) {
 	}
 	net.close(sock)
 }
+
+// More simultaneously open keep-alive connections than business workers must
+// all be answered. The event loop owns the connections; a worker only runs one
+// complete request at a time, so the old "one connection per worker" model
+// would leave the extra connections unanswered until the first ones close.
+@(test)
+test_http_e2e_connections_exceed_workers :: proc(t: ^testing.T) {
+	saved := context
+	context.allocator = runtime.default_allocator()
+	defer context = saved
+
+	env, ok := http_e2e_env(t, "http_more_conns")
+	if !ok {
+		return
+	}
+	defer web_test_stop(env)
+
+	conns := make([]Test_Conn, 4)
+	defer {
+		for &c in conns {
+			test_tcp_close(&c)
+		}
+		delete(conns)
+	}
+	// Everything is sent before anything is read: all four connections are
+	// open at the same time while the server was started with two workers.
+	for i in 0..<4 {
+		c, cok := test_tcp_dial(env.addr, 2 * time.Second)
+		if !cok {
+			testing.expectf(t, false, "connection %d: dial failed", i)
+			return
+		}
+		conns[i] = c
+		if !test_http_send(&conns[i], "GET", "/health", "", "") {
+			testing.expectf(t, false, "connection %d: send failed", i)
+			return
+		}
+	}
+	for i in 0..<4 {
+		resp, rok := test_http_read_response(&conns[i])
+		if !rok {
+			testing.expectf(t, false, "connection %d: no response", i)
+			continue
+		}
+		testing.expect_value(t, resp.status, 200)
+		testing.expect_value(t, resp.body, "OK")
+		testing.expectf(t, strings.contains(resp.headers, "Connection: keep-alive"), "connection %d: headers %q", i, resp.headers)
+	}
+}

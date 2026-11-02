@@ -7,6 +7,7 @@ import cachelib "../cache"
 import queuelib "../queue"
 import "core:fmt"
 import "core:net"
+import "core:nbio"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -232,7 +233,7 @@ http_read_request :: proc(c: ^netio.Conn, head, body: ^common.Buf, max_body: int
 		return req, .Body_Too_Large
 	}
 
-	if req.expect_continue {
+	if req.expect_continue && c.src == nil {
 		http_send_raw(c.sock, transmute([]u8)string("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	if req.chunked {
@@ -303,9 +304,11 @@ http_send_raw :: proc(sock: net.TCP_Socket, data: []u8) -> bool {
 
 CORS_HEADERS :: "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
 
-http_send :: proc(sock: net.TCP_Socket, code: int, ctype: string, body: []u8, keep_alive: bool, extra: string = "") -> bool {
-	hdr := common.buf_init(256)
-	defer common.buf_destroy(&hdr)
+// http_build_response renders a complete response (head and body) into one
+// buffer. The nbio server writes it from the event loop; http_send is the
+// blocking variant used by the parser's error replies.
+http_build_response :: proc(code: int, ctype: string, body: []u8, keep_alive: bool, extra: string = "") -> common.Buf {
+	hdr := common.buf_init(256 + len(body))
 	ct := ctype
 	if ct == "" {
 		ct = "text/plain; charset=utf-8"
@@ -320,29 +323,42 @@ http_send :: proc(sock: net.TCP_Socket, code: int, ctype: string, body: []u8, ke
 		common.buf_string(&hdr, extra)
 	}
 	common.buf_string(&hdr, "\r\n")
-	if !http_send_raw(sock, hdr.data[:]) {
-		return false
+	if len(body) > 0 {
+		common.buf_write(&hdr, body)
 	}
-	if len(body) > 0 && !http_send_raw(sock, body) {
-		return false
-	}
-	return true
+	return hdr
 }
 
-// http_send_read_error answers a request that failed before dispatch. The
-// response always carries Content-Length and Connection: close; the caller
-// closes the socket right after it, without draining the unread request.
-http_send_read_error :: proc(sock: net.TCP_Socket, err: Http_Read_Error) -> bool {
+http_send :: proc(sock: net.TCP_Socket, code: int, ctype: string, body: []u8, keep_alive: bool, extra: string = "") -> bool {
+	hdr := http_build_response(code, ctype, body, keep_alive, extra)
+	defer common.buf_destroy(&hdr)
+	return http_send_raw(sock, hdr.data[:])
+}
+
+// http_build_read_error renders the response for a request that failed before
+// dispatch. The response always carries Content-Length and Connection: close;
+// the caller closes the connection right after it, without draining the
+// unread request.
+http_build_read_error :: proc(err: Http_Read_Error) -> common.Buf {
 	switch err {
 	case .Header_Too_Large:
-		return http_send(sock, 431, "application/json", transmute([]u8)string(`{"error":"request header too large"}`), false)
+		return http_build_response(431, "application/json", transmute([]u8)string(`{"error":"request header too large"}`), false)
 	case .Body_Too_Large:
-		return http_send(sock, 413, "application/json", transmute([]u8)string(`{"error":"request body too large"}`), false)
+		return http_build_response(413, "application/json", transmute([]u8)string(`{"error":"request body too large"}`), false)
 	case .Bad_Request:
-		return http_send(sock, 400, "application/json", transmute([]u8)string(`{"error":"bad request"}`), false)
+		return http_build_response(400, "application/json", transmute([]u8)string(`{"error":"bad request"}`), false)
 	case .None, .Drop:
 	}
-	return false
+	return {}
+}
+
+http_send_read_error :: proc(sock: net.TCP_Socket, err: Http_Read_Error) -> bool {
+	hdr := http_build_read_error(err)
+	if hdr.data == nil {
+		return false
+	}
+	defer common.buf_destroy(&hdr)
+	return http_send_raw(sock, hdr.data[:])
 }
 
 // ---------------------------------------------------------------- server
@@ -363,27 +379,34 @@ default_server_config :: proc() -> Server_Config {
 }
 
 Server :: struct {
-	cfg:       Server_Config,
-	store:     ^logdb.Store,
-	cache:     ^cachelib.Cache,
+	cfg:        Server_Config,
+	store:      ^logdb.Store,
+	cache:      ^cachelib.Cache,
 	cache_file: string,
-	jobq:      ^queuelib.Queue,
-	listener:  net.TCP_Socket,
+	jobq:       ^queuelib.Queue,
+	listener:   net.TCP_Socket,
 	// bound_port is the port the listener actually bound. It differs from the
 	// configured port when listen uses ":0" for an ephemeral port.
 	bound_port: int,
-	mu:        sync.Mutex,
-	cond:      sync.Cond,
-	queue:     [dynamic]net.TCP_Socket,
-	// active holds sockets currently owned by a worker. server_stop shuts them
-	// down so workers blocked on an idle keep-alive connection return promptly.
-	active:    [dynamic]net.TCP_Socket,
-	stopping:  u32,
-	workers:   [dynamic]^thread.Thread,
-	start_ns:  i64,
-	requests:  u64,
-	errors:    u64,
-	conns:     u64,
+	// loop, live and accept_op are owned by the thread that runs server_run.
+	// Connections are no longer tied to worker threads: the event loop moves
+	// bytes and only complete requests are handed to the business workers.
+	loop:       ^nbio.Event_Loop,
+	live:       [dynamic]^Http_Conn,
+	accept_op:  ^nbio.Operation,
+	// mu guards the business-work queue shared with the worker pool.
+	mu:         sync.Mutex,
+	cond:       sync.Cond,
+	jobs:       [dynamic]^Http_Job,
+	workers:    [dynamic]^thread.Thread,
+	// pending counts jobs handed to a worker and not yet answered. The event
+	// loop drains it before tearing the loop down.
+	pending:    u32,
+	stopping:   u32,
+	start_ns:   i64,
+	requests:   u64,
+	errors:     u64,
+	conns:      u64,
 }
 
 server_init :: proc(cfg: Server_Config, store: ^logdb.Store, cache: ^cachelib.Cache = nil, queue: ^queuelib.Queue = nil) -> ^Server {
@@ -396,142 +419,11 @@ server_init :: proc(cfg: Server_Config, store: ^logdb.Store, cache: ^cachelib.Ca
 	return srv
 }
 
-http_worker :: proc(data: rawptr) {
-	srv := cast(^Server)data
-	for {
-		sync.mutex_lock(&srv.mu)
-		for len(srv.queue) == 0 && srv.stopping == 0 {
-			sync.cond_wait(&srv.cond, &srv.mu)
-		}
-		if srv.stopping != 0 {
-			sync.mutex_unlock(&srv.mu)
-			return
-		}
-		sock := pop(&srv.queue)
-		sync.mutex_unlock(&srv.mu)
-		if !conn_begin(srv, sock) {
-			net.close(sock)
-			continue
-		}
-		serve_connection(srv, sock)
-		conn_end(srv, sock)
-		net.close(sock)
-		sync.atomic_add(&srv.conns, 1)
-	}
-}
-
-// conn_begin registers a socket as active. It refuses when the server is
-// already stopping, in which case the worker must close the socket itself.
-conn_begin :: proc(srv: ^Server, sock: net.TCP_Socket) -> bool {
-	sync.mutex_lock(&srv.mu)
-	if sync.atomic_load(&srv.stopping) != 0 {
-		sync.mutex_unlock(&srv.mu)
-		return false
-	}
-	append(&srv.active, sock)
-	sync.mutex_unlock(&srv.mu)
-	return true
-}
-
-conn_end :: proc(srv: ^Server, sock: net.TCP_Socket) {
-	sync.mutex_lock(&srv.mu)
-	for s, i in srv.active {
-		if s == sock {
-			unordered_remove(&srv.active, i)
-			break
-		}
-	}
-	sync.mutex_unlock(&srv.mu)
-}
-
-serve_connection :: proc(srv: ^Server, sock: net.TCP_Socket) {
-	_ = net.set_option(sock, .Receive_Timeout, HTTP_IDLE_TIMEOUT)
-	_ = net.set_option(sock, .Send_Timeout, 30 * time.Second)
-	_ = net.set_option(sock, .TCP_Nodelay, true)
-
-	conn := netio.Conn{sock = sock}
-	head := common.buf_init(4096)
-	body := common.buf_init(4096)
-	defer common.buf_destroy(&head)
-	defer common.buf_destroy(&body)
-
-	for {
-		req, rerr := http_read_request(&conn, &head, &body, srv.cfg.max_body)
-		if rerr != .None {
-			if req.body_owned != nil {
-				delete(req.body_owned)
-			}
-			http_send_read_error(sock, rerr)
-			return
-		}
-		sync.atomic_add(&srv.requests, 1)
-		arena: common.Arena
-		resp := dispatch(srv, &req, &arena)
-		sent := http_send(sock, resp.code, resp.ctype, resp.body.data[:], req.keep_alive, resp.extra)
-		common.buf_destroy(&resp.body)
-		common.arena_destroy(&arena)
-		if req.body_owned != nil {
-			delete(req.body_owned)
-		}
-		if !sent || !req.keep_alive {
-			return
-		}
-	}
-}
-
-server_run :: proc(srv: ^Server) -> bool {
-	ep, ok := netio.parse_listen(srv.cfg.listen)
-	if !ok {
-		fmt.eprintf("oboe: invalid listen address %q\n", srv.cfg.listen)
-		return false
-	}
-	sock, lerr := net.listen_tcp(ep, 4096)
-	if lerr != nil {
-		fmt.eprintf("oboe: cannot listen on %s: %v\n", srv.cfg.listen, lerr)
-		return false
-	}
-	srv.listener = sock
-	if bound, berr := net.bound_endpoint(sock); berr == nil {
-		srv.bound_port = bound.port
-	} else {
-		srv.bound_port = ep.port
-	}
-	workers := srv.cfg.workers
-	if workers < 1 {
-		workers = 1
-	}
-	for _ in 0..<workers {
-		w := thread.create_and_start_with_data(srv, http_worker, self_cleanup = false, name = "oboe-http")
-		append(&srv.workers, w)
-	}
-	fmt.printf("oboe: listening on http://%s (workers=%d, data=%s)\n", srv.cfg.listen, workers, srv.store.cfg.data_path)
-	for sync.atomic_load(&srv.stopping) == 0 {
-		client, _, aerr := net.accept_tcp(sock)
-		if aerr != nil {
-			if sync.atomic_load(&srv.stopping) != 0 {
-				break
-			}
-			time.sleep(5 * time.Millisecond)
-			continue
-		}
-		sync.mutex_lock(&srv.mu)
-		if sync.atomic_load(&srv.stopping) != 0 || len(srv.queue) >= 1 << 18 {
-			sync.mutex_unlock(&srv.mu)
-			net.close(client)
-			continue
-		}
-		append(&srv.queue, client)
-		sync.cond_signal(&srv.cond)
-		sync.mutex_unlock(&srv.mu)
-	}
-	return true
-}
-
 // server_request_stop asks a running server to stop accepting connections.
 // It is async-signal-safe: it only stores an atomic flag and closes the
-// listening socket (close(2)). Worker threads are not joined and the connection
-// queues are not touched; the thread that owns server_run must call
-// server_stop afterwards to finish the teardown.
+// listening socket (close(2)). Business workers and the event loop are not
+// touched; the thread that owns server_run finishes the teardown itself, and
+// the caller joins the workers through server_stop.
 server_request_stop :: proc "contextless" (srv: ^Server) {
 	if srv == nil {
 		return
@@ -543,37 +435,28 @@ server_request_stop :: proc "contextless" (srv: ^Server) {
 	}
 }
 
+// server_stop stops a running server and joins the business workers. It is
+// safe to call from a thread that is not running the event loop. The live
+// connections are closed by server_run itself (see nbio_server.odin), so this
+// function never touches loop-owned state.
 server_stop :: proc(srv: ^Server) {
 	if srv == nil {
 		return
 	}
 	server_request_stop(srv)
 	sync.mutex_lock(&srv.mu)
-	// shutdown (not close) fds owned by workers: the worker still closes them
-	// after serve_connection returns, avoiding a double close on a reused fd.
-	for sock in srv.active {
-		net.shutdown(sock, .Both)
-	}
-	// Sockets queued but never handed to a worker are closed here; workers
-	// observe stopping under the same mutex and will not pop them.
-	for sock in srv.queue {
-		net.close(sock)
-	}
-	clear(&srv.queue)
 	sync.cond_broadcast(&srv.cond)
 	sync.mutex_unlock(&srv.mu)
 	for w in srv.workers {
 		thread.join(w)
 	}
-	delete(srv.active)
-	srv.active = nil
 	delete(srv.workers)
 	srv.workers = nil
 }
 
 // server_destroy stops a running server, closes connections that were still
-// queued for a worker, and frees the Server itself. It is safe to call on a
-// server that was never started.
+// live, and frees the Server itself. It is safe to call on a server that was
+// never started.
 server_destroy :: proc(srv: ^Server) {
 	if srv == nil {
 		return
@@ -581,15 +464,12 @@ server_destroy :: proc(srv: ^Server) {
 	if srv.listener != 0 {
 		server_stop(srv)
 	} else {
-		delete(srv.active)
-		srv.active = nil
 		delete(srv.workers)
 		srv.workers = nil
 	}
-	for sock in srv.queue {
-		net.close(sock)
-	}
-	delete(srv.queue)
-	srv.queue = nil
+	delete(srv.live)
+	srv.live = nil
+	delete(srv.jobs)
+	srv.jobs = nil
 	free(srv)
 }

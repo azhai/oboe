@@ -95,7 +95,7 @@ odin run examples/embed  # store/cache/queue 组合示例
 | --- | --- | --- |
 | `-data` | `./data` | 数据目录 |
 | `-listen` | `0.0.0.0:9428` | HTTP 监听地址 |
-| `-workers` | `8` | HTTP 工作线程数 |
+| `-workers` | `8` | HTTP 业务线程数（并发执行查询/写入的上限）；同时在线连接数不受此值限制 |
 | `-retention` | `30` | 保留天数；实际保留 N+1 个 UTC 日（含今天），`0` 表示永久 |
 | `-block-rows` | `8192` | 每个存储块的行数 |
 | `-merge-threshold` | `8` | 分区内 part 数达到该值时合并 |
