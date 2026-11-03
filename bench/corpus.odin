@@ -6,10 +6,13 @@ package main
 
 import "core:fmt"
 
+import "../logdb"
+
 HOSTS :: 4096
 USERS :: 8192
 DURATIONS :: 256
 SPREAD_NS :: i64(10 * 60 * 1_000_000_000)
+FIELDS_PER_ROW :: 6
 
 Corpus :: struct {
 	msgs:      []string,
@@ -80,4 +83,22 @@ row_ts :: proc(base_ts: i64, index, total: int) -> i64 {
 		return base_ts
 	}
 	return base_ts + i64(index) * SPREAD_NS / i64(total)
+}
+
+// corpus_fill_row writes one row into f (which must have FIELDS_PER_ROW
+// entries) and returns a Row referencing the corpus strings. The field layout
+// matches the one bench/ingest.odin uses when seeding.
+corpus_fill_row :: proc(c: ^Corpus, gi, total: int, base_ts: i64, f: []logdb.Field) -> logdb.Row {
+	f[0] = logdb.Field{name = "level", value = c.levels[gi % 4]}
+	f[1] = logdb.Field{name = "service", value = c.services[gi % 4]}
+	f[2] = logdb.Field{name = "zone", value = c.zones[gi % 3]}
+	f[3] = logdb.Field{name = "host", value = c.hosts[gi % HOSTS]}
+	f[4] = logdb.Field{name = "user", value = c.users[gi % USERS]}
+	f[5] = logdb.Field{name = "duration", value = c.durations[gi % DURATIONS]}
+	return logdb.Row{
+		ts     = row_ts(base_ts, gi, total),
+		stream = u64(gi % 4 + 1),
+		msg    = c.msgs[gi % len(c.msgs)],
+		fields = f[:FIELDS_PER_ROW],
+	}
 }

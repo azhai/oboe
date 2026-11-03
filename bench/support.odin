@@ -33,6 +33,7 @@ Params :: struct {
 	tube:       string,
 	rounds:     int,
 	value_size: int,
+	block_rows: int,
 }
 
 parse_params :: proc() -> Params {
@@ -53,6 +54,7 @@ parse_params :: proc() -> Params {
 		tube      = "bench",
 		rounds    = 20,
 		value_size = 64,
+		block_rows = 8192,
 	}
 	args := os.args
 	i := 1
@@ -119,6 +121,10 @@ parse_params :: proc() -> Params {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v); nok && n > 0 { p.value_size = n }
 			}
+		case "-block-rows":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n > 0 { p.block_rows = n }
+			}
 		case "-h", "-help", "--help":
 			print_usage()
 			os.exit(0)
@@ -149,7 +155,7 @@ next_arg :: proc(args: []string, i: ^int) -> (string, bool) {
 print_usage :: proc() {
 	fmt.println(`oboe bench — library and TCP benchmark suite
 
-  -mode        ingest|query|cache|queue-tcp|all   (default all)
+  -mode        ingest|query|cache|queue-tcp|flush-profile|all   (default all)
   -rows        rows to ingest                     (default 200000)
   -threads     concurrency for ingest/query/cache (default 8)
   -batch       rows per store_ingest call         (default 500)
@@ -167,7 +173,8 @@ print_usage :: proc() {
   -jobs        jobs to put/reserve                (default 100000)
   -rounds      bury+kick rounds                   (default 20)
   -tube        queue tube                         (default bench)
-  -value-size  small cache value bytes            (default 64)`)
+  -value-size  small cache value bytes            (default 64)
+  -block-rows  rows per storage block             (default 8192)`)
 }
 
 // ---------------------------------------------------------------- threads

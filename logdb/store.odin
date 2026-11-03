@@ -7,6 +7,7 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:sys/info"
 import "core:thread"
 import "core:time"
 
@@ -20,6 +21,9 @@ Store_Config :: struct {
 	block_rows:       int,
 	merge_threshold:  int,
 	merge_max_rows:   int,
+	// flush_threads is the number of threads encoding/compressing a part.
+	// 0 picks a value from the logical core count.
+	flush_threads:    int,
 }
 
 default_store_config :: proc() -> Store_Config {
@@ -32,7 +36,23 @@ default_store_config :: proc() -> Store_Config {
 		block_rows = 8192,
 		merge_threshold = 8,
 		merge_max_rows = 4_000_000,
+		flush_threads = 0,
 	}
+}
+
+// resolve_flush_threads caps the default at half the logical cores so that
+// HTTP workers and the encoder do not fight over every core, and at eight
+// because zlib saturates memory bandwidth well before that.
+resolve_flush_threads :: proc(requested: int) -> int {
+	if requested > 0 {
+		return requested
+	}
+	_, logical, ok := info.cpu_core_count()
+	if !ok || logical <= 2 {
+		return 1
+	}
+	n := logical / 2
+	return clamp(n, 2, 8)
 }
 
 Mem_Part :: struct {
@@ -79,11 +99,17 @@ row_less :: proc(a, b: Row) -> bool {
 	return a.ts < b.ts
 }
 
+// sort_rows orders rows by (stream, ts), the layout every part relies on.
+sort_rows :: proc(rows: []Row) {
+	slice.sort_by(rows, row_less)
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 	s := new(Store)
 	s.cfg = cfg
+	s.cfg.flush_threads = resolve_flush_threads(cfg.flush_threads)
 	os.make_directory_all(s.cfg.data_path)
 	partitions_dir := fmt.aprintf("%s/partitions", s.cfg.data_path)
 	os.make_directory_all(partitions_dir)
@@ -359,10 +385,10 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	p.mem = Mem_Part{rows = make([dynamic]Row, 0, 4096)}
 	sync.rw_mutex_unlock(&s.mu)
 
-	slice.sort_by(old_rows[:], row_less)
+	sort_rows(old_rows[:])
 	seq := sync.atomic_add(&s.seq, u64(1))
 	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
-	part, ok := write_part(part_dir, old_rows[:], s.cfg.block_rows)
+	part, ok := write_part_parallel(part_dir, old_rows[:], s.cfg.block_rows, s.cfg.flush_threads)
 	delete(part_dir)
 	if ok {
 		sync.rw_mutex_lock(&s.mu)

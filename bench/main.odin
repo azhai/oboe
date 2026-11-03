@@ -9,13 +9,15 @@ import "../logdb"
 
 main :: proc() {
 	p := parse_params()
-	defer if !p.keep && !p.reuse && p.mode != "cache" && p.mode != "queue-tcp" {
+	defer if !p.keep && !p.reuse && p.mode != "cache" && p.mode != "queue-tcp" && p.mode != "flush-profile" {
 		os.remove_all(p.data)
 	}
 
 	switch p.mode {
 	case "ingest":
 		run_ingest(p)
+	case "flush-profile":
+		run_flush_profile(p)
 	case "query":
 		s := open_store(p, p.reuse)
 		defer logdb.store_close(s)
