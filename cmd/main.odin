@@ -76,6 +76,7 @@ Flags (logs):
   -merge-threshold <n>    merge a partition once it has N parts (default 8)
   -stream-fields <list>   comma-separated fields that identify a stream (default "level,service")
   -flush-interval <dur>   memtable flush interval, e.g. 1s, 500ms (default 1s)
+  -flush-threads <n>      threads encoding a part during flush (default: half the logical cores)
 
 Flags (cache):
   -cache-size <size>      in-memory capacity, e.g. 256MB, 8GB (default 256MB, 0 = unlimited)
@@ -214,6 +215,12 @@ main :: proc() {
 			if v, ok := next_arg(args, &i); ok {
 				if d, dok := parse_duration_arg(v); dok && d > 0 {
 					store_cfg.flush_interval = d
+				}
+			}
+		case "-flush-threads", "--flush-threads":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v, 10); nok && n > 0 {
+					store_cfg.flush_threads = n
 				}
 			}
 		case "-stream-fields", "--stream-fields":

@@ -28,6 +28,7 @@ run "$ODIN_BIN" build cmd -out:"$OUT_DIR/oboe"
 run "$ODIN_BIN" test tests -all-packages
 run "$ODIN_BIN" test tests -all-packages -define:ODIN_STRESS=1
 run "$ODIN_BIN" build bench -out:"$OUT_DIR/oboe_bench"
+run "$ODIN_BIN" build bench/loadgen -out:"$OUT_DIR/oboe_loadgen"
 run "$ODIN_BIN" run examples/embed
 
 printf '\nci: all steps passed in %ds\n' "$((SECONDS - TOTAL_START))"

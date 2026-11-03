@@ -12,7 +12,8 @@
 各组件可以按需嵌入其他程序（见 [库用法](docs/library.md)）。
 
 更多文档：[模块与包布局](docs/modules.md) · [架构说明](docs/architecture.md) ·
-[测试指南](docs/testing.md) · [库用法](docs/library.md) · [贡献指南](CONTRIBUTING.md)。
+[测试指南](docs/testing.md) · [库用法](docs/library.md) ·
+[基准与压测](docs/benchmarks.md) · [贡献指南](CONTRIBUTING.md)。
 
 操作手册（cookbook）：[日志写入](docs/cookbook/logs-ingest.md) ·
 [LogsQL 查询](docs/cookbook/logsql.md) · [HTTP API](docs/cookbook/http-api.md) ·
