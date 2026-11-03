@@ -2,9 +2,12 @@ package logdb
 
 import "../common"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
+import "core:thread"
 
 // Storage tests that need directories keep them unique per process and per test
 // so concurrent test runners never share state.
@@ -462,4 +465,135 @@ test_store_more_part_seq_no_reuse :: proc(t: ^testing.T) {
 	testing.expect(t, found_new)
 	st := store_stats(s)
 	testing.expect_value(t, st.rows, 40)
+}
+
+// A part removed by a merge must stay usable (and on disk) until the reader
+// that captured it releases its reference; the last release removes the
+// directory.
+@(test)
+test_part_refs_defer_close_until_release :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("part_refs")
+	os.remove_all(dir)
+	defer delete(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	rows := []Ingest_Row{{ts = 1_700_000_000_000_000_000, stream = 1, msg = "keep me"}}
+	store_ingest(s, rows)
+	store_flush_all(s)
+	part := s.partitions[0].parts[0]
+	part_dir := strings.clone(part.dir)
+	defer delete(part_dir)
+
+	part_retain(part)
+	part_unlink(part)
+	testing.expect(t, os.exists(part_dir), "unlink must keep the directory while a reader holds it")
+	// The store no longer owns the part; store_close must not close it twice.
+	clear(&s.partitions[0].parts)
+
+	d, ok := read_block(part, &part.index[0])
+	testing.expect(t, ok)
+	part_release(part)
+	if ok {
+		decoded_destroy(&d)
+	}
+	testing.expect(t, !os.exists(part_dir), "last release must remove the directory")
+}
+
+Part_Ref_Reader :: struct {
+	s:         ^Store,
+	stop:      ^u64,
+	committed: ^i64,
+	failures:  ^i64,
+	alloc:     mem.Allocator,
+}
+
+part_ref_reader :: proc(data: rawptr) {
+	ctx := cast(^Part_Ref_Reader)data
+	context.allocator = ctx.alloc
+	for sync.atomic_load(ctx.stop) == 0 {
+		committed := sync.atomic_load(ctx.committed)
+		seen := make(map[i64]bool)
+		res := execute_query(ctx.s, &Query{}, 10_000)
+		// Every row committed before the snapshot must be visible, and no row
+		// may be seen twice while flushes and merges swap parts underneath.
+		if len(res.rows) < int(committed) {
+			sync.atomic_add(ctx.failures, 1)
+		}
+		for r in res.rows {
+			if r.ts in seen {
+				sync.atomic_add(ctx.failures, 1)
+			}
+			seen[r.ts] = true
+		}
+		delete(seen)
+		result_destroy(&res)
+	}
+}
+
+// Queries scan parts without the store lock, so they must observe every committed
+// row exactly once while flushes and merges replace parts concurrently.
+@(test)
+test_concurrent_query_and_merge :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("query_merge_race")
+	os.remove_all(dir)
+	defer delete(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	cfg.merge_threshold = 2
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	fields := []Field{{name = "level", value = "info"}}
+	base := i64(1_700_000_000_000_000_000)
+	stop := u64(0)
+	committed := i64(0)
+	failures := i64(0)
+
+	ctx := Part_Ref_Reader{s = s, stop = &stop, committed = &committed, failures = &failures, alloc = context.allocator}
+	readers := make([dynamic]^thread.Thread, 0, 2)
+	defer delete(readers)
+	for _ in 0 ..< 2 {
+		r := thread.create_and_start_with_data(&ctx, part_ref_reader, self_cleanup = false, name = "q-reader")
+		if r != nil {
+			append(&readers, r)
+		}
+	}
+
+	const_rounds :: 12
+	const_rows :: 40
+	for round in 0 ..< const_rounds {
+		batch := make([]Ingest_Row, const_rows)
+		for i in 0 ..< const_rows {
+			n := round * const_rows + i
+			batch[i] = Ingest_Row{
+				ts     = base + i64(n) * 1_000_000,
+				stream = u64(n % 4),
+				msg    = "race row",
+				fields = fields,
+			}
+		}
+		store_ingest(s, batch)
+		store_flush_all(s)
+		delete(batch)
+		sync.atomic_store(&committed, i64(round + 1) * const_rows)
+		if round % 2 == 0 {
+			store_merge_all(s)
+		}
+	}
+	store_merge_all(s)
+
+	sync.atomic_store(&stop, 1)
+	for r in readers {
+		thread.join(r)
+		thread.destroy(r)
+	}
+
+	testing.expect_value(t, sync.atomic_load(&failures), i64(0))
+	st := store_stats(s)
+	testing.expect_value(t, st.rows, const_rounds * const_rows)
 }

@@ -87,6 +87,9 @@ Store :: struct {
 	// mem_rows counts the rows waiting in memtables. Ingest uses it to apply
 	// backpressure once the backlog outgrows what a single flush can drain.
 	mem_rows:       u64,
+	// active_scans counts queries that captured a part snapshot; store_close
+	// waits for them so it never frees a part a scan is still reading.
+	active_scans:   i64,
 	merged_parts:   u64,
 	queries:        u64,
 	dropped_rows:   u64,
@@ -371,8 +374,15 @@ store_close :: proc(s: ^Store) {
 		s.worker = nil
 	}
 	store_flush_all(s)
+	// Scans released the store lock but may still be reading parts, so wait for
+	// them before anything is freed.
+	for sync.atomic_load(&s.active_scans) > 0 {
+		time.sleep(1 * time.Millisecond)
+	}
 	sync.rw_mutex_lock(&s.mu)
 	for p in s.partitions {
+		// Shutdown keeps the parts on disk; just close the handles. Unlinking
+		// here would delete the freshly flushed data.
 		for part in p.parts {
 			close_part(part)
 		}
@@ -747,12 +757,12 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 	delete(p.parts)
 	p.parts = kept
 	append(&p.parts, part)
-	sync.rw_mutex_unlock(&s.mu)
-	// No readers can hold the old parts after this exclusive section.
+	// Readers that captured the old parts keep them alive until they release
+	// the reference; otherwise the directories are removed here.
 	for old in chosen {
-		os.remove_all(old.dir)
-		close_part(old)
+		part_unlink(old)
 	}
+	sync.rw_mutex_unlock(&s.mu)
 	sync.atomic_add(&s.merged_parts, u64(len(chosen)))
 	delete(chosen)
 }
@@ -828,16 +838,29 @@ store_apply_retention :: proc(s: ^Store) {
 	}
 	delete(s.partitions)
 	s.partitions = kept
+	// Parts still referenced by an in-flight scan are closed by that scan. The
+	// partition directory can only go away when no scan holds any of them.
+	for p in removed {
+		busy := false
+		for part in p.parts {
+			if sync.atomic_load(&part.refs) > 0 {
+				busy = true
+				break
+			}
+		}
+		for part in p.parts {
+			part_unlink(part)
+		}
+		if !busy {
+			os.remove_all(p.dir)
+		}
+	}
 	sync.rw_mutex_unlock(&s.mu)
 	for p in removed {
 		sync.atomic_sub(&s.mem_rows, u64(len(p.mem.rows)))
-		for part in p.parts {
-			close_part(part)
-		}
 		delete(p.parts)
 		delete(p.mem.rows)
 		common.arena_destroy(&p.mem.arena)
-		os.remove_all(p.dir)
 		delete(p.dir)
 		free(p)
 	}
