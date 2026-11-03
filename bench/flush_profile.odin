@@ -29,8 +29,13 @@ run_flush_profile :: proc(p: Params) {
 	}
 
 	// The sort pass leaves the rows in part order; every later pass works on
-	// that sorted layout, exactly like a real flush does.
-	sort_ctx := Profile_Sort_Ctx{rows = rows, rng = 0x9e3779b97f4a7c15}
+	// that sorted layout, exactly like a real flush does. Both the serial sort
+	// and the production (parallel) sort are timed so the two stay comparable.
+	serial_sort_ctx := Profile_Sort_Ctx{rows = rows, rng = 0x9e3779b97f4a7c15, threads = 1}
+	serial_sort_ms := profile_median(p.reps, profile_do_sort, &serial_sort_ctx)
+	profile_emit(p, "sort-serial", serial_sort_ms, f64(p.rows), 0, 0)
+
+	sort_ctx := Profile_Sort_Ctx{rows = rows, rng = 0x9e3779b97f4a7c15, threads = p.threads}
 	sort_ms := profile_median(p.reps, profile_do_sort, &sort_ctx)
 	logdb.sort_rows(rows)
 
@@ -97,15 +102,16 @@ run_flush_profile :: proc(p: Params) {
 // ---------------------------------------------------------------- phases
 
 Profile_Sort_Ctx :: struct {
-	rows: []logdb.Row,
-	rng:  u64,
+	rows:    []logdb.Row,
+	rng:     u64,
+	threads: int,
 }
 
 profile_do_sort :: proc(rep: int, ctx: rawptr) -> f64 {
 	c := cast(^Profile_Sort_Ctx)ctx
 	profile_shuffle(c.rows, &c.rng)
 	begin := time.now()
-	logdb.sort_rows(c.rows)
+	logdb.sort_rows(c.rows, c.threads)
 	return millis(time.since(begin))
 }
 

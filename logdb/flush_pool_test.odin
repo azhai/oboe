@@ -116,3 +116,32 @@ test_parallel_part_matches_serial :: proc(t: ^testing.T) {
 		delete(b)
 	}
 }
+
+// Parallel sorting must produce the same permutation as the serial sort: keys
+// here are unique, so any difference in order is a real bug in the chunk/merge
+// boundaries rather than an artifact of an unstable sort.
+@(test)
+test_parallel_sort_matches_serial :: proc(t: ^testing.T) {
+	const_rows :: 20_003
+	rows := make([]Row, const_rows)
+	defer delete(rows)
+	serial := make([]Row, const_rows)
+	defer delete(serial)
+	for i in 0 ..< const_rows {
+		// ts is unique, so every (stream, ts) key is unique too.
+		rows[i] = Row{ts = i64(i) * 3, stream = u64((i * 7) % 13 + 1)}
+	}
+	copy(serial, rows)
+	slice.sort_by(serial, row_less)
+
+	sort_rows(rows, 8)
+
+	for i in 0 ..< len(rows) {
+		// Keys are unique, so a matching stream/ts pair at every index proves
+		// the parallel sort produced exactly the serial permutation.
+		if rows[i].ts != serial[i].ts || rows[i].stream != serial[i].stream {
+			testing.expectf(t, false, "parallel sort differs from serial sort at row %d", i)
+			return
+		}
+	}
+}

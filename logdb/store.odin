@@ -99,9 +99,108 @@ row_less :: proc(a, b: Row) -> bool {
 	return a.ts < b.ts
 }
 
+// Sorting dominates the flush of a large memtable, so above
+// SORT_PARALLEL_MIN_ROWS the slice is split into contiguous chunks, one per
+// thread. Each chunk is sorted independently and the sorted runs are merged
+// into a scratch buffer afterwards. The merge is serial but visits each row
+// once with at most `chunks` (i.e. thread count) comparisons, which is far
+// cheaper than the sort it replaces.
+SORT_PARALLEL_MIN_ROWS :: 8192
+SORT_CHUNK_MIN_ROWS :: 2048
+
+Sort_Ctx :: struct {
+	rows:   []Row,
+	bounds: []int,
+	cursor: u32,
+}
+
+sort_chunk_worker :: proc(data: rawptr) {
+	c := cast(^Sort_Ctx)data
+	for {
+		i := int(sync.atomic_add(&c.cursor, 1))
+		if i + 1 >= len(c.bounds) {
+			break
+		}
+		slice.sort_by(c.rows[c.bounds[i]:c.bounds[i + 1]], row_less)
+	}
+}
+
 // sort_rows orders rows by (stream, ts), the layout every part relies on.
-sort_rows :: proc(rows: []Row) {
-	slice.sort_by(rows, row_less)
+sort_rows :: proc(rows: []Row, threads := 0) {
+	n := len(rows)
+	parallel := resolve_flush_threads(threads)
+	if parallel <= 1 || n < SORT_PARALLEL_MIN_ROWS {
+		slice.sort_by(rows, row_less)
+		return
+	}
+	chunks := clamp(n / SORT_CHUNK_MIN_ROWS, 1, parallel)
+	if chunks <= 1 {
+		slice.sort_by(rows, row_less)
+		return
+	}
+	bounds := make([]int, chunks + 1)
+	defer delete(bounds)
+	base := n / chunks
+	extra := n % chunks
+	off := 0
+	for i in 0 ..< chunks {
+		bounds[i] = off
+		off += base
+		if i < extra {
+			off += 1
+		}
+	}
+	bounds[chunks] = n
+	ctx := Sort_Ctx{rows = rows, bounds = bounds}
+	spawned := make([dynamic]^thread.Thread, 0, chunks - 1)
+	defer delete(spawned)
+	for _ in 0 ..< chunks - 1 {
+		t := thread.create_and_start_with_data(&ctx, sort_chunk_worker, self_cleanup = false, name = "oboe-sort")
+		if t == nil {
+			// A failed spawn only lowers parallelism: the calling thread keeps
+			// claiming chunks until every run is sorted.
+			break
+		}
+		append(&spawned, t)
+	}
+	sort_chunk_worker(&ctx)
+	for t in spawned {
+		thread.join(t)
+		thread.destroy(t)
+	}
+	merge_sorted_chunks(rows, bounds)
+}
+
+merge_sorted_chunks :: proc(rows: []Row, bounds: []int) {
+	k := len(bounds) - 1
+	if k <= 1 {
+		return
+	}
+	tmp := make([]Row, len(rows))
+	defer delete(tmp)
+	cursors := make([]int, k)
+	defer delete(cursors)
+	copy(cursors, bounds[:k])
+	for dst in 0 ..< len(rows) {
+		best := -1
+		for i in 0 ..< k {
+			if cursors[i] >= bounds[i + 1] {
+				continue
+			}
+			// `<` on purpose: on a tie the lowest chunk wins, so equal keys stay
+			// ordered by chunk index and a sorted chunk's internal order is
+			// preserved as far as smoothsort allows.
+			if best < 0 || row_less(rows[cursors[i]], rows[cursors[best]]) {
+				best = i
+			}
+		}
+		if best < 0 {
+			break
+		}
+		tmp[dst] = rows[cursors[best]]
+		cursors[best] += 1
+	}
+	copy(rows, tmp)
 }
 
 // ---------------------------------------------------------------- lifecycle
