@@ -106,11 +106,12 @@ store_config :: proc(dir: string) -> logdb.Store_Config {
 	return cfg
 }
 
-// apply_threads forwards the -sort-threads / -flush-threads switches, which
-// exist so the flush profile can compare serial and parallel runs.
+// apply_threads forwards the -sort-threads / -flush-threads / -ingest-shards
+// switches, which exist so the flush profile can compare serial and parallel runs.
 apply_threads :: proc(cfg: ^logdb.Store_Config, p: Params) {
 	cfg.sort_threads = p.sort_threads
 	cfg.flush_threads = p.flush_threads
+	cfg.ingest_shards = p.ingest_shards
 }
 
 // open_store loads an existing directory or seeds a fresh one. Seeding is

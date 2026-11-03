@@ -102,6 +102,8 @@ odin run examples/embed  # store/cache/queue 组合示例
 | `-merge-threshold` | `8` | 分区内 part 数达到该值时合并 |
 | `-stream-fields` | `level,service` | 构成 stream 的字段，逗号分隔 |
 | `-flush-interval` | `1s` | memtable 落盘间隔 |
+| `-sort-threads` | `0`（自动） | 刷盘前 memtable 排序线程数；`0` = `clamp(逻辑核/2, 2, 4)`，小 memtable 自动串行 |
+| `-ingest-shards` | `0`（自动） | 每个分区 memtable 的分片数（各自一把锁、各自 arena）；`0` = 逻辑核数，钳在 4..16 |
 | `-cache-size` | `256MB` | 缓存容量，支持 `KB/KiB/MB/MiB/GB/GiB`，`0` 为不限 |
 | `-cache-max-entries` | `1000000` | 缓存 key 数量上限（近似，按桶均分），`0` 为不限 |
 | `-cache-max-value` | `16MB` | 单个 value 大小上限 |

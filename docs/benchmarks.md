@@ -133,6 +133,7 @@ oboe_bench -mode flush-profile -data /tmp/d -profile-reps 3 -block-rows 8192
 | `-rows` / `-threads` / `-batch` | 播种行数、并发线程、每批行数 |
 | `-profile-reps` / `-block-rows` | `flush-profile` 每档重复次数（默认 3）、每块行数（默认 8192） |
 | `-sort-threads` / `-flush-threads` | 覆盖刷盘的排序/编码线程数，0 = 按逻辑核自动；`flush-profile` 用它做串行与并行对照 |
+| `-ingest-shards` | 覆盖每个分区 memtable 的分片数（独立锁），0 = 自动（逻辑核数，钳在 4..16）；`flush-profile` 用它做单锁与分片对照 |
 | `-reps` / `-warm` | 每类查询的测量次数与预热次数 |
 | `-ops` / `-ops-large` / `-value-size` | 缓存操作数、大值操作数、小值字节数 |
 | `-data` / `-keep` / `-reuse` | 数据目录；保留；复用已有数据 |
@@ -761,4 +762,99 @@ zlib 31.0 → 31.1；bloom:finish 51.5 → 51.9；merge 404.2 → 352.3。
   （94 基线 + 本轮的字节一致测试），`-define:ODIN_STRESS=1` 99 全绿。
 - `bench/run_matrix.sh --only small --reps 1 --no-soak` 播种与查询无退化（见下）。
 - `flush-profile` prof-off 自对照：20 万 −0.5%、500 万 −0.6%，插桩开销在噪声内。
+
+## ingest 分片锁（2026-11-03）
+
+### 结论
+
+- 8 线程 ingest 的瓶颈确实是**同一把写锁把整批串起来**：改前每批持 `s.mu` 写锁，500 万行
+  10000 次调用累计等锁 **6947.3 ms**，占流水线+锁 **38.8%**，每次调用 84% 的时间在排队。
+- 把 memtable 按分区内分片（默认 10 = 逻辑核数）切成独立锁的追加缓冲后：ingest
+  **1388.1 → 382.6 ms（3.6x）**，3.60M → **13.07M rows/s**；等锁合计占 **3.5%**
+  （等 store 共享锁 0.2% + 等分片锁 3.3%），单批调用里等分片锁 14.5%，都低于 15%。
+  20 万行同样 **51.3 → 15.7 ms（3.3x）**，等锁 32.7% → **2.6%**。
+- 单线程不退化：3M 行 `-threads 1` 改前 2.965/3.004M rows/s、改后 2.990/2.949M，噪声内。
+- 写锁粒度没有停在「分区级」：基准数据只有一个 UTC 日分区，分区级锁不会带来任何并发；
+  真正起作用的是分区**内部**的分片。分片数不是线程数，而是 store 配置
+  （`-ingest-shards`，0 = 逻辑核数，钳在 4..16），因此单线程与多线程看到的是同一套语义。
+
+### 实现
+
+1. `Partition` 的单个 `Mem_Part` 换成 `shards: []Ingest_Shard`，每个分片自带
+   `sync.Mutex`、`[dynamic]Row`、独立 `common.Arena` 和 `bytes`。分片数在分区创建时固定，
+   列表不再变化，所以读列表不需要额外锁。
+2. `store_ingest` 整批只持有 **`s.mu` 共享锁**（防止 retention 在批次中途释放分区），
+   然后按「连续同 UTC 日的行段」取一次**分片锁**：正常 500 行一批只加一次锁，
+   不引入每行加锁。分片用 `next_shard` 原子轮转，所以即使 8 个线程都写同一个分区，
+   也会落到不同分片。
+3. 批次里出现尚未建分区的日（每天第一批）走慢路径：放掉共享锁 → 写锁建分区 → 重新取共享锁，
+   不占用热路径。
+4. flush 的 swap 仍在 `s.mu` 写锁下，但偷取内容时只拿各分片自己的锁：
+   先取走该分片的 rows/arena 并把原子计数减掉，再重置分片。`s.mu` 写锁保证
+   「查询正在扫 memtable」时不会看到行凭空消失（part 还没挂上）；分片锁保证
+   正在追加到该分片的批不会漏行——追加在偷取之后发生的行留在新 memtable 里。
+5. `flush_max_rows` / `flush_max_bytes` 触发条件不变，改为读分区上的原子累计值
+   （分片内追加时加、偷取时减，加减都在该分片锁内完成，因此不会出现负数）。
+   `store_stats.mem_rows` 同样是这些原子值之和。
+6. `flush_interval` 用分区级 `since_ns`：变空时清零，下一次追加时写入当前时间。
+   极端情况下（清零与并发追加刚好交错）新 memtable 的 `since_ns` 可能为 0，导致
+   下一个 tick 提前刷一次（不丢行、只是多一个小 part），这是有意的取舍。
+7. 查询路径 `execute.odin` 扫 memtable 时改为逐分片持锁扫描，避免与并发追加竞争
+   `[dynamic]Row` 的扩容。
+
+### 前后对比（同一台机器、3 次中位数）
+
+| tier | 改前 ingest | 改后 ingest | 加速 | 等锁占比（改前 → 改后） |
+|---|---:|---:|---:|---:|
+| 20 万行 | 51.3 ms（3.90M rows/s） | 15.7 ms（12.78M rows/s） | **3.3x** | 32.7% → **2.6%** |
+| 500 万行 | 1388.1 ms（3.60M rows/s） | 382.6 ms（13.07M rows/s） | **3.6x** | 38.8% → **3.5%** |
+
+500 万行锁明细（`flush-profile`，8 线程，10000 次 ingest 调用）：
+
+| 项 | 改前 | 改后 |
+|---|---:|---:|
+| ingest 等写锁 / 等 store 共享锁 | 6947.3 ms（694.7 µs/次） | 21.4 ms（2.1 µs/次） |
+| ingest 等分片锁 | – | 380.4 ms（38.0 µs/次） |
+| ingest 持锁累计 | 1327.1 ms | 2605.0 ms（现在是真的并行干活） |
+| flush 等写锁 | 0.19 ms | 0.19 ms |
+| memtable swap 持锁 | 0.02 ms | 0.17 ms（10 个分片各拿一次锁） |
+| 流水线合计 / 锁等待占比 | 10987 / 41.0%* | 11046 / **3.5%** |
+
+\* 改前那次 flush-profile 的 lock 等待里 2.6% 是「flush 追加 part 等锁」，本窗口为 0；
+两个窗口的后台 load 不同，绝对值不可直接比，**占比**才是结论。
+
+改后 ingest 每批的持锁时间从 ~133 µs 涨到 ~260 µs，是因为改前 8 个线程 84% 的时间在排队、
+真正干活的时间被稀释；现在 8 个线程同时拷贝，累计 thread-time 更接近 wall×8。
+
+### 语义与顺序取舍
+
+- **不变**：`flush_max_rows` / `flush_max_bytes` 触发阈值、retention、memtable 行数指标、
+  swap 与 ingest 的一致性（不丢行、不重复）。`ingest_bytes` 统计口径不变。
+- **变了（1）**：memtable 内的行顺序。改前是全局到达顺序；改后是「按分片轮转追加，
+  flush 时按分片顺序拼接」。排序后 part 仍按 `(stream, ts)` 排列，但 `(stream, ts)`
+  **完全相同**的行之间的相对顺序可能不同。既有逐字节断言都不受影响：
+  `sort_pool_test` 直接构造数组做 1 vs 4 线程对比、`test_store_more_merge_zero_copy_part_bytes_match`
+  用的是唯一 `ts`，都不经过分片追加；`test_store_ingest_shards_concurrent_flush` 也只用唯一 `ts`。
+  并发 ingest 时到达顺序本来就是非确定的，所以这个取舍只在单线程写入时有可见差别。
+- **变了（2）**：查询不再把 ingest 挡在门外。改前 ingest 持写锁，查询持共享锁，二者互斥；
+  改后查询与 ingest 都是共享锁 + 分片锁，查询可能看到扫描过程中新到的行（也可能看不到
+  正在别的分片追加的行）。这是并发追加的必然结果，换来的是 ingest 不再被查询的长扫描阻塞。
+- 每个分区有 `ingest_shards` 个 arena，每个 1 MiB chunk 惰性分配：活跃分区常驻约
+  `ingest_shards` MiB，flush 后归还。分片数上限 16 就是为了封住这部分内存。
+
+### 新增测试
+
+`logdb/shard_test.odin: test_store_ingest_shards_concurrent_flush`（普通与 STRESS 都会跑）：
+6 个写线程 × 50 批 × 40 行 = 12000 行，跨 2 个 UTC 日，期间另一个线程循环
+`store_flush_due` + `store_flush_all`。结束后断言：
+
+- `store_stats().rows == 12000`、`mem_rows == 0`、`parts > 0`；
+- 逐块 `read_block` 扫描全部 part，每个 `ts` **恰好出现一次**（无丢行、无重复、无崩溃）。
+
+### 回归
+
+- `odin build cmd` / `odin build bench` ✅；`odin test tests -all-packages` **96 全绿**
+  （95 + 本轮的并发测试），`-define:ODIN_STRESS=1` **100 全绿**；普通套件连跑 5 次全绿。
+- `bench/run_matrix.sh --only small --reps 1 --no-soak`：播种 12.6M rows/s（改前 10.07M）、
+  查询无退化（见下）。
 

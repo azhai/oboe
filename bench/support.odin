@@ -37,6 +37,7 @@ Params :: struct {
 	block_rows:   int,
 	sort_threads: int,
 	flush_threads: int,
+	ingest_shards: int,
 }
 
 parse_params :: proc() -> Params {
@@ -61,6 +62,7 @@ parse_params :: proc() -> Params {
 		block_rows   = 8192,
 		sort_threads = 0,
 		flush_threads = 0,
+		ingest_shards = 0,
 	}
 	args := os.args
 	i := 1
@@ -143,6 +145,10 @@ parse_params :: proc() -> Params {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v); nok && n >= 0 { p.flush_threads = n }
 			}
+		case "-ingest-shards":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n > 0 { p.ingest_shards = n }
+			}
 		case "-h", "-help", "--help":
 			print_usage()
 			os.exit(0)
@@ -195,7 +201,8 @@ print_usage :: proc() {
   -block-rows    rows per block for flush-profile  (default 8192)
   -profile-reps  flush-profile repetitions per tier (default 3)
   -sort-threads  memtable sort threads, 0 = auto      (default 0)
-  -flush-threads part encode/compress threads, 0 = auto (default 0)`)
+  -flush-threads part encode/compress threads, 0 = auto (default 0)
+  -ingest-shards memtable stripes per partition, 0 = auto (default 0)`)
 }
 
 // ---------------------------------------------------------------- threads

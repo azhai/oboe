@@ -156,12 +156,12 @@ profile_merge_run :: proc(p: Params, tier: string, rows, rep: int) -> Profile_Ru
 profile_json_line :: proc(tier, scenario: string, rep: int, r: Profile_Run) {
 	ph := r.prof.phase[0]
 	fmt.printf(
-		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"sort_scatter_ms":%.2f,"sort_segment_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d,"merge_pin_blocks":%d}}`,
+		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"sort_scatter_ms":%.2f,"sort_segment_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"shard_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d,"merge_pin_blocks":%d}}`,
 		scenario, tier, rep, r.rows, r.wall_ms, r.ingest_ms, r.drain_ms,
 		ph.blocks, f64(ph.zlib_ns)/1e6, f64(ph.sort_ns)/1e6,
 		f64(ph.sort_scatter_ns)/1e6, f64(ph.sort_segment_ns)/1e6,
 		f64(ph.write_data_ns+ph.write_bloom_ns)/1e6, f64(r.prof.flush_wait_ns)/1e6,
-		ph.raw_bytes, ph.comp_bytes, r.prof.merge_pin_blocks,
+		f64(r.prof.ingest_shard_wait_ns)/1e6, ph.raw_bytes, ph.comp_bytes, r.prof.merge_pin_blocks,
 	)
 	fmt.println()
 }
@@ -176,10 +176,10 @@ profile_print_flush :: proc(p: Params, tier: string, rows: int, runs: []Profile_
 	pipeline := ph.sort_ns + ph.collect_ns + ph.serialize_ns + ph.zlib_ns +
 		ph.bloom_finish_ns + ph.write_data_ns + ph.write_bloom_ns + ph.index_ns +
 		ph.finish_index_ns + ph.finish_meta_ns + ph.finish_open_ns
-	waits := med.ingest_wait_ns + med.flush_wait_ns + med.flush_append_wait_ns
+	waits := med.ingest_wait_ns + med.ingest_shard_wait_ns + med.flush_wait_ns + med.flush_append_wait_ns
 
-	fmt.printf("\n=== flush %s: %d rows, %d reps, threads=%d batch=%d block_rows=%d sort_threads=%d flush_threads=%d (0=auto) ===\n",
-		tier, rows, len(runs), p.threads, p.batch, p.block_rows, p.sort_threads, p.flush_threads)
+	fmt.printf("\n=== flush %s: %d rows, %d reps, threads=%d batch=%d block_rows=%d sort_threads=%d flush_threads=%d ingest_shards=%d (0=auto) ===\n",
+		tier, rows, len(runs), p.threads, p.batch, p.block_rows, p.sort_threads, p.flush_threads, p.ingest_shards)
 	fmt.printf("  ingest %.1f ms (%.0f rows/s) | flush 累计 %.1f ms（%d 次） | drain+close %.1f ms（含 worker 退出等待） | wall %.1f ms | %d blocks | %.1f MiB raw -> %.1f MiB on disk (%.2fx)\n",
 		profile_median_f64(runs, .Ingest), profile_rows_per_s(rows, profile_median_f64(runs, .Ingest) * 1e6),
 		f64(med.flush_total_ns)/1e6, med.flush_calls,
@@ -211,13 +211,15 @@ profile_print_flush :: proc(p: Params, tier: string, rows: int, runs: []Profile_
 		f64(waits)/1e6, profile_share(waits, pipeline + waits))
 
 	fmt.printf("  %-24s %-8s %-10s %-10s %-14s\n", "锁/切换", "次数", "总耗时ms", "每次µs", "占流水线+锁")
-	lock_row("ingest 等写锁", med.ingest_calls, med.ingest_wait_ns, pipeline + waits)
-	lock_row("flush 等写锁(swap)", med.flush_calls, med.flush_wait_ns, pipeline + waits)
+	lock_row("ingest 等 store 锁", med.ingest_calls, med.ingest_wait_ns, pipeline + waits)
+	lock_row("ingest 等分片锁", med.ingest_shard_calls, med.ingest_shard_wait_ns, pipeline + waits)
+	lock_row("flush 等 store 锁", med.flush_calls, med.flush_wait_ns, pipeline + waits)
 	lock_row("flush 追加 part 等锁", med.flush_calls, med.flush_append_wait_ns, pipeline + waits)
 	lock_row("memtable swap(持锁)", med.flush_calls, med.flush_swap_ns, pipeline + waits)
-	fmt.printf("  ingest 调用累计 %.1f ms（%d 线程合计），其中 %.1f ms 等锁（%.1f%%），%.1f ms 持锁\n",
+	fmt.printf("  ingest 调用累计 %.1f ms（%d 线程合计），其中 %.1f ms 等 store 锁（%.1f%%）、%.1f ms 等分片锁（%.1f%%），%.1f ms 持锁\n",
 		f64(med.ingest_total_ns)/1e6, p.threads, f64(med.ingest_wait_ns)/1e6,
 		profile_share(med.ingest_wait_ns, med.ingest_total_ns),
+		f64(med.ingest_shard_wait_ns)/1e6, profile_share(med.ingest_shard_wait_ns, med.ingest_total_ns),
 		f64(med.ingest_hold_ns)/1e6)
 
 	block_distribution("flush blocks", ph, lph, hph)

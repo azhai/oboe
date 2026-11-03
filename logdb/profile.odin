@@ -63,12 +63,16 @@ Phase_Stats :: struct {
 }
 
 Flush_Profile :: struct {
-	// ingest side: time blocked on the store write lock vs time holding it
+	// ingest side: time blocked on the store lock (shared, kept for partition
+	// lifetime) vs time holding it; the append itself is broken out into the
+	// per-shard lock wait below
 	ingest_calls:   u64,
 	ingest_rows:    u64,
 	ingest_wait_ns: u64,
 	ingest_hold_ns: u64,
 	ingest_total_ns: u64,
+	ingest_shard_calls:   u64,
+	ingest_shard_wait_ns: u64,
 
 	// flush side: lock wait for the memtable swap, the swap itself, and the
 	// short lock taken when the finished part is attached

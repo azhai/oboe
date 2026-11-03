@@ -28,6 +28,9 @@ Store_Config :: struct {
 	// 0 picks a value from the logical core count; small memtables always sort
 	// serially (see sort_rows_parallel).
 	sort_threads:     int,
+	// ingest_shards stripes a partition's memtable into this many independently
+	// locked append buffers. 0 picks a value from the logical core count.
+	ingest_shards:    int,
 }
 
 default_store_config :: proc() -> Store_Config {
@@ -42,6 +45,7 @@ default_store_config :: proc() -> Store_Config {
 		merge_max_rows = 4_000_000,
 		flush_threads = 0,
 		sort_threads = 0,
+		ingest_shards = 0,
 	}
 }
 
@@ -74,18 +78,40 @@ resolve_sort_threads :: proc(requested: int) -> int {
 	return clamp(logical / 2, 2, 4)
 }
 
-Mem_Part :: struct {
-	rows:     [dynamic]Row,
-	arena:    common.Arena,
-	bytes:    i64,
-	since_ns: i64,
+// resolve_ingest_shards makes the shard count at least four so ingest batches
+// never queue behind each other, and at most sixteen because each shard keeps
+// its own arena around.
+resolve_ingest_shards :: proc(requested: int) -> int {
+	if requested > 0 {
+		return requested
+	}
+	_, logical, ok := info.cpu_core_count()
+	if !ok || logical <= 3 {
+		return 4
+	}
+	return clamp(logical, 4, 16)
+}
+
+// Ingest_Shard is one stripe of a partition's memtable. It owns its lock, row
+// array and arena, so batches that land on different stripes never serialise.
+Ingest_Shard :: struct {
+	mu:    sync.Mutex,
+	rows:  [dynamic]Row,
+	arena: common.Arena,
+	bytes: i64,
 }
 
 Partition :: struct {
-	day:   i64,
-	dir:   string,
-	mem:   Mem_Part,
-	parts: [dynamic]^Disk_Part,
+	day:        i64,
+	dir:        string,
+	shards:     []Ingest_Shard,
+	next_shard: u32,
+	// memtable totals: written under the owning shard's lock, read without one
+	// (flush_due, store_stats), so they are atomics.
+	mem_rows:  u64,
+	mem_bytes: i64,
+	since_ns:  i64,
+	parts:     [dynamic]^Disk_Part,
 }
 
 Store :: struct {
@@ -130,6 +156,7 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 	s.cfg = cfg
 	s.cfg.flush_threads = resolve_flush_threads(cfg.flush_threads)
 	s.cfg.sort_threads = resolve_sort_threads(cfg.sort_threads)
+	s.cfg.ingest_shards = resolve_ingest_shards(cfg.ingest_shards)
 	os.make_directory_all(s.cfg.data_path)
 	partitions_dir := fmt.aprintf("%s/partitions", s.cfg.data_path)
 	os.make_directory_all(partitions_dir)
@@ -149,6 +176,7 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 			p := new(Partition)
 			p.day = day
 			p.dir = strings_clone_dir(fi.fullpath)
+			partition_alloc_shards(p, s.cfg.ingest_shards)
 			parts_dir := fmt.aprintf("%s/parts", p.dir)
 			part_entries, perr := os.read_directory_by_path(parts_dir, -1, context.allocator)
 			// Parts superseded by a completed merge are still referenced by
@@ -279,8 +307,7 @@ store_close :: proc(s: ^Store) {
 			close_part(part)
 		}
 		delete(p.parts)
-		delete(p.mem.rows)
-		common.arena_destroy(&p.mem.arena)
+		partition_free_shards(p)
 		delete(p.dir)
 		free(p)
 	}
@@ -298,31 +325,53 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	active := flush_profile_enabled()
 	t_entry := prof_stage_start(active)
 	t_locked: time.Time
-	total_bytes: i64
-	sync.rw_mutex_lock(&s.mu)
+	now := common.now_ns()
+	for i in 0..<len(rows) {
+		if rows[i].ts <= 0 {
+			rows[i].ts = now
+		}
+	}
+
+	// The store lock stays shared for the whole batch: it keeps partitions alive
+	// against retention, but concurrent batches no longer exclude each other.
+	sync.rw_mutex_shared_lock(&s.mu)
+	if !batch_partitions_present(s, rows) {
+		// A day without a partition is rare (first batch of a day), so the
+		// exclusive upgrade is off the hot path.
+		sync.rw_mutex_shared_unlock(&s.mu)
+		sync.rw_mutex_lock(&s.mu)
+		for i := 0; i < len(rows); {
+			day := common.utc_day(rows[i].ts)
+			_ = get_partition(s, day)
+			i = day_run_end(rows, i, day)
+		}
+		sync.rw_mutex_unlock(&s.mu)
+		sync.rw_mutex_shared_lock(&s.mu)
+	}
 	if active {
 		t_locked = time.now()
 		sync.atomic_add(&flush_prof.ingest_wait_ns, u64(time.since(t_entry)))
 		sync.atomic_add(&flush_prof.ingest_calls, 1)
 		sync.atomic_add(&flush_prof.ingest_rows, u64(len(rows)))
 	}
-	now := common.now_ns()
-	for i in 0..<len(rows) {
-		r := &rows[i]
-		if r.ts <= 0 {
-			r.ts = now
+
+	// Contiguous day runs share one shard lock, so a normal batch takes exactly
+	// one append lock. The round-robin cursor spreads concurrent batches over
+	// different shards even when they all target the same partition.
+	total_bytes: i64
+	i := 0
+	for i < len(rows) {
+		day := common.utc_day(rows[i].ts)
+		j := day_run_end(rows, i, day)
+		if p := find_partition(s, day); p != nil {
+			idx := int(sync.atomic_add(&p.next_shard, u32(1))) % len(p.shards)
+			total_bytes += append_shard_rows(p, &p.shards[idx], rows[i:j], now)
 		}
-		day := common.utc_day(r.ts)
-		p := get_partition(s, day)
-		append_mem_row(p, r, now)
-		total_bytes += i64(len(r.msg))
-		for f in r.fields {
-			total_bytes += i64(len(f.name) + len(f.value))
-		}
+		i = j
 	}
 	sync.atomic_add(&s.ingested_rows, u64(len(rows)))
 	sync.atomic_add(&s.ingested_bytes, u64(total_bytes))
-	sync.rw_mutex_unlock(&s.mu)
+	sync.rw_mutex_shared_unlock(&s.mu)
 	if active {
 		sync.atomic_add(&flush_prof.ingest_hold_ns, u64(time.since(t_locked)))
 		sync.atomic_add(&flush_prof.ingest_total_ns, u64(time.since(t_entry)))
@@ -330,11 +379,62 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	return len(rows)
 }
 
-get_partition :: proc(s: ^Store, day: i64) -> ^Partition {
+// batch_partitions_present reports whether every day in the batch already has a
+// partition, so the common case never needs the exclusive lock.
+batch_partitions_present :: proc(s: ^Store, rows: []Ingest_Row) -> bool {
+	i := 0
+	for i < len(rows) {
+		day := common.utc_day(rows[i].ts)
+		i = day_run_end(rows, i, day)
+		if find_partition(s, day) == nil {
+			return false
+		}
+	}
+	return true
+}
+
+find_partition :: proc(s: ^Store, day: i64) -> ^Partition {
 	for p in s.partitions {
 		if p.day == day {
 			return p
 		}
+	}
+	return nil
+}
+
+day_run_end :: proc(rows: []Ingest_Row, i: int, day: i64) -> int {
+	j := i + 1
+	for j < len(rows) && common.utc_day(rows[j].ts) == day {
+		j += 1
+	}
+	return j
+}
+
+// append_shard_rows copies a run of rows into one shard under a single lock.
+append_shard_rows :: proc(p: ^Partition, sh: ^Ingest_Shard, rows: []Ingest_Row, now: i64) -> i64 {
+	active := flush_profile_enabled()
+	t := prof_stage_start(active)
+	sync.mutex_lock(&sh.mu)
+	if active {
+		sync.atomic_add(&flush_prof.ingest_shard_wait_ns, u64(time.since(t)))
+		sync.atomic_add(&flush_prof.ingest_shard_calls, 1)
+	}
+	if sync.atomic_load(&p.since_ns) == 0 {
+		sync.atomic_store(&p.since_ns, now)
+	}
+	bytes: i64
+	for i in 0..<len(rows) {
+		bytes += append_mem_row(sh, &rows[i])
+	}
+	sync.atomic_add(&p.mem_rows, u64(len(rows)))
+	sync.atomic_add(&p.mem_bytes, bytes)
+	sync.mutex_unlock(&sh.mu)
+	return bytes
+}
+
+get_partition :: proc(s: ^Store, day: i64) -> ^Partition {
+	if p := find_partition(s, day); p != nil {
+		return p
 	}
 	p := new(Partition)
 	p.day = day
@@ -345,33 +445,53 @@ get_partition :: proc(s: ^Store, day: i64) -> ^Partition {
 	parts_dir := fmt.aprintf("%s/parts", dir)
 	os.make_directory_all(parts_dir)
 	delete(parts_dir)
+	partition_alloc_shards(p, s.cfg.ingest_shards)
 	append(&s.partitions, p)
 	return p
 }
 
-append_mem_row :: proc(p: ^Partition, r: ^Ingest_Row, now: i64) {
-	fields := common.arena_alloc(&p.mem.arena, len(r.fields) * size_of(Field), align_of(Field))
+partition_alloc_shards :: proc(p: ^Partition, n: int) {
+	p.shards = make([]Ingest_Shard, n)
+	for i in 0..<n {
+		p.shards[i].rows = make([dynamic]Row, 0, 256)
+	}
+}
+
+partition_free_shards :: proc(p: ^Partition) {
+	for &sh in p.shards {
+		delete(sh.rows)
+		common.arena_destroy(&sh.arena)
+	}
+	delete(p.shards)
+}
+
+row_bytes :: proc(r: ^Ingest_Row) -> i64 {
+	b := i64(len(r.msg) + len(r.fields) * size_of(Field))
+	for f in r.fields {
+		b += i64(len(f.name) + len(f.value))
+	}
+	return b
+}
+
+append_mem_row :: proc(sh: ^Ingest_Shard, r: ^Ingest_Row) -> i64 {
+	fields := common.arena_alloc(&sh.arena, len(r.fields) * size_of(Field), align_of(Field))
 	fs := slice.from_ptr(cast(^Field)raw_data(fields), len(r.fields))
 	for i in 0..<len(r.fields) {
 		fs[i] = Field{
-			name = common.arena_str(&p.mem.arena, r.fields[i].name),
-			value = common.arena_str(&p.mem.arena, r.fields[i].value),
+			name = common.arena_str(&sh.arena, r.fields[i].name),
+			value = common.arena_str(&sh.arena, r.fields[i].value),
 		}
 	}
 	row := Row{
 		ts = r.ts,
 		stream = r.stream,
-		msg = common.arena_str(&p.mem.arena, r.msg),
+		msg = common.arena_str(&sh.arena, r.msg),
 		fields = fs,
 	}
-	if len(p.mem.rows) == 0 {
-		p.mem.since_ns = now
-	}
-	append(&p.mem.rows, row)
-	p.mem.bytes += i64(len(r.msg) + len(r.fields) * size_of(Field))
-	for f in r.fields {
-		p.mem.bytes += i64(len(f.name) + len(f.value))
-	}
+	b := row_bytes(r)
+	append(&sh.rows, row)
+	sh.bytes += b
+	return b
 }
 
 // ---------------------------------------------------------------- flush
@@ -381,11 +501,11 @@ store_flush_due :: proc(s: ^Store) {
 	due: [dynamic]^Partition
 	sync.rw_mutex_shared_lock(&s.mu)
 	for p in s.partitions {
-		n := len(p.mem.rows)
+		n := int(sync.atomic_load(&p.mem_rows))
 		if n == 0 {
 			continue
 		}
-		if n >= s.cfg.flush_max_rows || p.mem.bytes >= s.cfg.flush_max_bytes || now - p.mem.since_ns >= i64(s.cfg.flush_interval) {
+		if n >= s.cfg.flush_max_rows || sync.atomic_load(&p.mem_bytes) >= s.cfg.flush_max_bytes || now - sync.atomic_load(&p.since_ns) >= i64(s.cfg.flush_interval) {
 			append(&due, p)
 		}
 	}
@@ -411,28 +531,62 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	active := flush_profile_enabled()
 	t_entry := prof_stage_start(active)
 	t_locked: time.Time
+	stolen: [dynamic][]Row
+	old_arenas: [dynamic]common.Arena
+	defer {
+		delete(stolen)
+		delete(old_arenas)
+	}
+	// The swap still takes the write lock: it keeps readers (queries scan the
+	// memtable under a shared lock) from observing rows leave the memtable
+	// without the part they were flushed into being visible yet. Ingest only
+	// holds a shared lock, so ingest-vs-ingest is no longer serialised here.
 	sync.rw_mutex_lock(&s.mu)
 	if active {
 		t_locked = time.now()
 		flush_prof.flush_wait_ns += u64(time.since(t_entry))
 	}
-	if len(p.mem.rows) == 0 {
-		sync.rw_mutex_unlock(&s.mu)
+	// Steal every shard's contents. Only the owning shard lock is taken, so an
+	// ingest batch appending to another shard never waits for this swap.
+	total := 0
+	for &sh in p.shards {
+		sync.mutex_lock(&sh.mu)
+		n := len(sh.rows)
+		if n > 0 {
+			append(&stolen, sh.rows[:])
+			append(&old_arenas, sh.arena)
+			sync.atomic_sub(&p.mem_rows, u64(n))
+			sync.atomic_sub(&p.mem_bytes, sh.bytes)
+			total += n
+			sh.rows = make([dynamic]Row, 0, 4096)
+			sh.arena = {}
+			sh.bytes = 0
+		}
+		sync.mutex_unlock(&sh.mu)
+	}
+	if sync.atomic_load(&p.mem_rows) == 0 {
+		sync.atomic_store(&p.since_ns, 0)
+	}
+	sync.rw_mutex_unlock(&s.mu)
+	if active {
+		flush_prof.flush_swap_ns += u64(time.since(t_locked))
+	}
+	if total == 0 {
 		if active {
 			flush_prof.flush_calls += 1
 			flush_prof.flush_total_ns += u64(time.since(t_entry))
 		}
 		return true
 	}
-	old_rows := p.mem.rows
-	old_arena := p.mem.arena
-	p.mem = Mem_Part{rows = make([dynamic]Row, 0, 4096)}
-	sync.rw_mutex_unlock(&s.mu)
-	if active {
-		// The swap is the only part of a flush that holds the write lock, so
-		// it is exactly what ingest batches have to wait for.
-		flush_prof.flush_swap_ns += u64(time.since(t_locked))
+	old_rows := make([]Row, total)
+	defer delete(old_rows)
+	off := 0
+	for sr in stolen {
+		copy(old_rows[off:], sr[:])
+		off += len(sr)
+		delete(sr)
 	}
+	clear(&stolen)
 
 	t := prof_stage_start(active)
 	sort_rows_parallel(old_rows[:], s.cfg.sort_threads)
@@ -456,21 +610,25 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 		sync.atomic_add(&s.flushed_parts, 1)
 	} else {
 		fmt.eprintf("oboe: flush failed for %s (%d rows)\n", p.dir, len(old_rows))
-		sync.rw_mutex_lock(&s.mu)
-		now := common.now_ns()
+		failed := make([]Ingest_Row, len(old_rows))
 		for i in 0..<len(old_rows) {
 			r := &old_rows[i]
-			append_mem_row(p, &Ingest_Row{ts = r.ts, stream = r.stream, msg = r.msg, fields = r.fields}, now)
+			failed[i] = Ingest_Row{ts = r.ts, stream = r.stream, msg = r.msg, fields = r.fields}
 		}
-		sync.rw_mutex_unlock(&s.mu)
+		sync.rw_mutex_shared_lock(&s.mu)
+		now := common.now_ns()
+		_ = append_shard_rows(p, &p.shards[0], failed, now)
+		sync.rw_mutex_shared_unlock(&s.mu)
+		delete(failed)
 	}
-	common.arena_destroy(&old_arena)
+	for &a in old_arenas {
+		common.arena_destroy(&a)
+	}
 	if active {
 		flush_prof.flush_calls += 1
 		flush_prof.flush_rows += u64(len(old_rows))
 		flush_prof.flush_total_ns += u64(time.since(t_entry))
 	}
-	delete(old_rows)
 	return ok
 }
 
@@ -763,8 +921,7 @@ store_apply_retention :: proc(s: ^Store) {
 			close_part(part)
 		}
 		delete(p.parts)
-		delete(p.mem.rows)
-		common.arena_destroy(&p.mem.arena)
+		partition_free_shards(p)
 		os.remove_all(p.dir)
 		delete(p.dir)
 		free(p)
@@ -787,7 +944,7 @@ store_stats :: proc(s: ^Store) -> Store_Stats {
 	sync.rw_mutex_shared_lock(&s.mu)
 	for p in s.partitions {
 		st.partitions += 1
-		st.mem_rows += len(p.mem.rows)
+		st.mem_rows += int(sync.atomic_load(&p.mem_rows))
 		for part in p.parts {
 			st.parts += 1
 			st.rows += part.meta.rows
