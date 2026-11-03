@@ -90,6 +90,14 @@ bloom_builder_add_hash :: proc(bb: ^Bloom_Builder, h: u64) {
 bloom_builder_add_value :: proc(bb: ^Bloom_Builder, field, value: string) {
 	base := common.fnv(common.FNV_BASIS, field)
 	base = common.fnv_continue(base, "\x00")
+	bloom_builder_add_value_base(bb, base, value)
+}
+
+// bloom_builder_add_value_base is the same insert with the per-field prefix
+// hash already folded in (fnv(field) followed by the separator). A block that
+// indexes one column thousands of times hashes the field name once instead of
+// per value.
+bloom_builder_add_value_base :: proc(bb: ^Bloom_Builder, base: u64, value: string) {
 	full_h: u64
 	keyed := len(value) > 0 && len(value) <= 512
 	if keyed {

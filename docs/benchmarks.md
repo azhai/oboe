@@ -858,3 +858,111 @@ zlib 31.0 → 31.1；bloom:finish 51.5 → 51.9；merge 404.2 → 352.3。
 - `bench/run_matrix.sh --only small --reps 1 --no-soak`：播种 12.6M rows/s（改前 10.07M）、
   查询无退化（见下）。
 
+
+## encode 一遍扫描：列名缓存 + bloom 值去重（2026-11-03）
+
+### 结论
+
+`encode collect`（行 → 列数组 + bloom token 哈希）从 merge 的 45.4% 降到 30.8%，
+**5M 档 collect 1102.3 ms → 547.4 ms（2.01x）**，merge 总耗时 **2429.0 ms → 1777.5 ms（1.37x）**；
+顺带 `bloom:finish` 也快了 **3.05x**（146.1 → 47.9 ms），因为去重后的哈希表小了 6 倍。
+part 字节完全未变（golden SHA-256 测试守门）。目标（collect ≥1.3x）达成。
+
+### 先量准：collect 里到底是谁贵
+
+把融合的行循环临时拆成「只列化」「只 bloom」两趟，在合并路径上测得的份额是
+**列化 14% / bloom 86%**（5M：157.1 ms / 928.1 ms）。所以这一轮的收益必须来自 bloom，
+单纯"把两次字段遍历合成一次"最多只能省列化那一小半。
+
+拆成两趟的副作用也一并量了：合并路径几乎同价（1085 vs 1102 ms），但 flush 路径从
+1532.9 ms 涨到 2130.6 ms —— 两趟意味着两遍 full scan，在 8 个并行 encode worker 争内存带宽时
+掉得更狠。所以**保留融合的单趟循环**，只在里面把重复工作去掉。
+
+### 贵在哪：每个值都在重算，重复值也在重算
+
+改前每个 (field, value) 都要：
+
+1. `find_enc_col` 线性扫列表找列（7 列 × 7 次查找/行）；
+2. `bloom_builder_add_value` 里用 `fnv(field)` 重算字段名前缀；
+3. 为了命中 memo，先对**整个 value 做一遍 FNV**（msg ≈ 65 B），再拿 `full_h` 查 256 槽直接映射表；
+4. 命中 memo 还要把 hash 列表 `copy` 一遍追加进 `bb.hashes`。
+
+第 3 步是关键浪费：语料里 msg 只有 32 种、level 4 种、service 4 种、zone 3 种、duration 256 种，
+但每一行都把 65 B 的 msg 重哈希一次只为确认"又是它"。
+
+### 实现
+
+1. **列名字典**：每个 block 一个 32 槽开放寻址表（键 = 长度 + 尾部 8 字节的 FNV），列解析从
+   线性扫描变成 O(1) 平均；`_msg` 固定为第 0 列，热循环里直接写，不做查找。
+2. **字段前缀只算一次**：`Enc_Col.base = fnv(name) + "\0"`，新增
+   `bloom_builder_add_value_base(bb, base, value)`；每列每 block 一次，而不是每值一次。
+3. **每个列一份 64 槽值缓存**（`keys / cached / used`）：键 = 长度 + 尾部 8 字节 FNV，
+   命中要求**整串相等**（`cached[slot] == value`），键碰撞只会退化成走完整路径。
+4. **重复值直接跳过 bloom**：块的 bloom 只保留哈希**集合**——`bloom_builder_finish` 本来就用
+   开放寻址表把重复哈希折叠成 `uniq` 个，再由 `uniq` 决定 `nbits`，置位是 OR。所以同一个
+   (列, 值) 在块内第二次出现时**不追加任何哈希**，输出位图逐位相同。这是
+   "`n` 变小但 `uniq` 不变 → `target` 不变 → `nbits` 不变"的等价变换，不是近似。
+5. 列化与 bloom 在**同一次字段遍历**里完成，一个字段只解析一次名字。
+
+缓存全部是 block 内局部的（`Enc_Schema` 在 `encode_block` 栈上，块结束即销毁），
+不跨块、不持有字符串指针，merge 的 pin 生命周期不受影响。
+
+### 同窗口前后 A/B（改前/改后二进制交替各跑 2 轮，每轮 3 reps 取中位数）
+
+merge 500 万行：
+
+| 项 | 改前 | 改后 | 变化 |
+|---|---:|---:|---:|
+| merge 总耗时 | 2429.0 / 2446.3 ms | 1777.5 / 1783.8 ms | **1.37x** |
+| encode:行→列+bloom哈希 | 1102.3 / 1111.7 ms（45.4%） | 547.4 / 548.0 ms（30.8%） | **2.01x** |
+| bloom:finish | 146.1 / 146.4 ms | 47.7 / 48.1 ms | **3.05x** |
+| encode:serialize | 191.9 / 192.0 ms | 191.3 ms | 持平 |
+| zlib (level 1) | 737.4 / 741.1 ms | 741.1 / 737.4 ms | 持平 |
+
+merge 20 万行：总耗时 100.35 / 101.79 → 74.5 / 75.5 ms（**1.35x**）；
+collect 43.4 / 44.3 → 21.6 / 21.8 ms（**2.03x**）；bloom:finish 5.97 / 6.09 → 2.09 / 2.14 ms。
+
+单 part 刷盘（flush 500 万行，`flush_threads` 自动 = 并行 encode）：
+
+| 项 | 改前 | 改后 | 变化 |
+|---|---:|---:|---:|
+| 流水线合计 | 3544.1 / 3537.7 ms | 2811.6 / 2803.7 ms | **1.26x** |
+| encode collect | 1532.9 / 1540.5 ms | 1096.0 / 1093.3 ms | **1.40x** |
+| bloom:finish | 279.1 / 276.3 ms | 90.8 / 89.7 ms | **3.08x** |
+
+刷盘档的 collect 只快 1.40x（合并档 2.01x）：flush 用多个 encode worker 并行跑，
+`collect_ns` 是 thread-time 累计，8~10 个 worker 同时做哈希时内存带宽先到顶，
+省下来的哈希量换不成等比例的 thread-time。合并路径是单线程编码，收益接近理论上限。
+
+口径提醒：本窗口 load 比上一轮低（基线 merge 2429 ms，上一轮同档 8558 ms），
+所以这里只做**同窗口交替 A/B**，不跨窗口比绝对值。
+
+### golden 测试：字节不变由常量守门
+
+`logdb/part_golden_test.odin: test_part_golden_bytes_sha256`
+
+- 固定语料：3 个 stream × 40 行、`block_rows = 16`、5 个字段（每 stream 一个常量列 `zone`、
+  缓慢变化的 `level`、每行变化的 `service/host/duration`）+ `_msg`，时间戳固定。
+- 用 `write_part` 落盘后对 `data.bin` / `bloom.bin` / `index.bin` 取 SHA-256，
+  与常量逐字符比较，并额外断言三个文件的确切字节数：
+
+| 文件 | SHA-256 | 字节 |
+|---|---|---:|
+| data.bin | `7927ae0d92f889d4cade54efe411304fe0eab1868869ac92297959c0a3856f2d` | 3812 |
+| bloom.bin | `56d0e2b17f3e622f1ea85d419e986f3803ce59a6b485a0f49eaf957d36e93e53` | 1920 |
+| index.bin | `1f0413538ef30352d3c6a80ee70a9ab11fb022d6fa1c1ee3327e9e4f52a95abc` | 588 |
+
+（`meta.json` 含 `created_ns`，不参与指纹。）常量由**优化前的编码器**生成，之后任何人动 encode
+都会被这条测试拦下。要改常量就等于改格式，必须同时改 `BLOCK_VERSION` 并在本文档留记录。
+
+保留了原有的字节断言：串行 vs 并行排序一致性、`test_store_more_merge_zero_copy_part_bytes_match`
+（merge 输出与参考 part 逐字节比对）。
+
+### 回归
+
+- `odin build cmd` / `odin build bench` ✅；
+  `odin test tests -all-packages` **97 全绿**（96 + 本轮 golden 测试），
+  `-define:ODIN_STRESS=1` **101 全绿**。
+- `bench/run_matrix.sh --only small --reps 1 --no-soak`：EXIT=0、`failures.txt` 空，
+  播种 36.2M rows/s、flush 5.52M rows/s，查询 filter 8784 qps @8 / stats 1737 qps @8 / sort 350 qps @8，
+  无退化。
