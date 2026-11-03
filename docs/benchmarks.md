@@ -966,3 +966,142 @@ collect 43.4 / 44.3 → 21.6 / 21.8 ms（**2.03x**）；bloom:finish 5.97 / 6.09
 - `bench/run_matrix.sh --only small --reps 1 --no-soak`：EXIT=0、`failures.txt` 空，
   播种 36.2M rows/s、flush 5.52M rows/s，查询 filter 8784 qps @8 / stats 1737 qps @8 / sort 350 qps @8，
   无退化。
+
+## 有界背压：memtable 硬上限、有界等待与 503（2026-11-03）
+
+### 结论
+
+memtable 从"只有触发阈值、没有上限"改成**硬上限 + 阻塞等待 + 有界等待**：
+
+- 新参数 `-mem-max-rows`（默认 600 万）与 `-mem-max-bytes`（默认 1 GiB）：整库（所有分区
+  合计）的 memtable 估算量超过上限时，`store_ingest` 先在条件变量上等 flush 释放空间，
+  而不是继续堆积。
+- 等待有界：`-mem-wait`（默认 2 s）。等满预算仍放不下就**拒绝整批**，HTTP 三个写入端点
+  （`/insert/jsonline`、`/insert/elasticsearch/_bulk`、`/insert/loki/api/v1/push`）返回
+  `503` + `Retry-After: 1` + `Connection: close`，不再把请求挂死。
+- 实测（8 s、8 并发、100 行/请求，jsonline）：默认 cap 下 **RSS 峰值 3171 MB**、
+  **SIGTERM 退出 1942 ms**、`store_close` 1852.9 ms；cap 关闭时 8 s 内 RSS 就**越过
+  4 GiB**（第 5.9 s 触发监控保护被强杀），证明上限确实把"无界"变成了"有界"。
+- 吞吐：这条 HTTP 写入路径本身的上限约 1.0–1.2M rows/s，cap 开/关都在同一水平
+  （1.21M vs 1.20M），**背压在此路径上没有吞吐代价**；把等待预算调到 100 ms 时
+  5 s 内出现 168 次 503，请求最大延迟 103 ms。
+- 与本轮无关的 flush/merge 路径完全没变：同窗口交替 A/B 全部落在 ±1% 内。
+
+### 为什么默认是 6M 行 / 1 GiB
+
+按 jsonline 语料实测约 **165 B/行**（消息 + 字段名/值 + `Field` 结构）：
+
+```
+6_000_000 行 × ~165 B/行 ≈ 990 MB ≈ 0.97 GiB
+1 GiB = 1024 MiB（字节上限，二者同量级，任一先到即可拦住）
+```
+
+两个上限同时生效、取更严的那个；`flush_max_rows = 20 万`，所以上限是它的 30 倍——
+flush 跟得上时永远不会触发等待，跟不上时最多驻留 ~1 GiB。
+
+**RSS 峰值约为上限的 3 倍**，因为 flush 的工作集与 memtable 重叠：上限一刻的 arena
+（≈1 GiB）+ 偷出的行副本（`old_rows`）+ 排序/编码缓冲。实测 1 GiB cap → 3171 MB 峰值、
+512 MiB cap（`-mem-max-rows 3000000 -mem-max-bytes 512MB`）→ 1670 MB 峰值。
+小内存机器建议直接从 512 MiB 起。
+
+### 实现
+
+1. **整库记账**：`Store` 增加 `mem_rows` / `mem_bytes` 原子计数，ingest 在追加前按
+   `row_bytes` 预扣，flush 偷走 memtable 后归还，retention 删分区时也归还。
+2. **上限检查与预扣在同一临界区**（`space_mu`）：避免"检查通过 → flush 扣减 → 两个批次
+   各自超卖一次"的竞态。
+3. **先预扣、再拿 store 锁**：`reserve_mem` 在 `s.mu` **之前**完成，等待时只持有
+   `space_mu`；flush 的顺序是 `mu -> space_mu`。因此锁依赖是单向的（`mu → space_mu`），
+   不存在 ingest 等 flush、flush 等 ingest 的环。
+4. **有界等待**：`sync.cond_wait_with_timeout`，每次醒来重算剩余预算并重新检查；等满
+   `mem_wait` 返回 `rejected`。`store_ingest_bounded` 返回
+   `(accepted, stalled_ns, rejected)`，旧的 `store_ingest` 保留为薄包装。
+5. **压力触发提前 flush**：memtable 用量 ≥ 上限一半时，后台线程把"有行的分区"全部落盘，
+   不必等 `flush_interval` 或 `flush_max_rows`，让被阻塞的写入在下一次 tick 拿到空间。
+6. **关停唤醒**：`store_close` 先置 `stop` 再 `cond_broadcast`，等待者在超时前立即
+   返回 `false`（不会睡满 2 s）；同时 **merge 在 block 边界检查 `stop` 并中止**——
+   否则一次大合并会把 SIGTERM 拖成 10 s+（实测 20 s 压测时曾出现 11.7 s）。
+   中止的合并不写 `merged_from`，源 part 原样保留，下次 tick 重做。
+7. **HTTP 语义**：三个写入 handler 都走 `store_ingest_bounded(srv.store, rows, mem_wait)`，
+   `503` 统一补 `Retry-After: 1` 并 `Connection: close`（`mark_ingest_overload`）。
+
+### 同窗口前后 A/B（本轮提交 vs 上一轮提交，二进制交替各跑 2 轮 × 3 reps）
+
+本轮只动写入准入与关停，不碰 encode/flush/merge 的字节与算法，所以 `flush-profile`
+应当**没有变化**——实测也确实没有：
+
+| 项 | 上一轮（c7b62c8） | 本轮 | 变化 |
+|---|---:|---:|---:|
+| flush 500 万 wall | 3165.3 / 3201.0 ms | 3199.1 / 3203.8 ms | +1.1% / +0.1% |
+| merge 500 万 总耗时 | 6251.6 / 6232.0 ms | 6214.7 / 6214.8 ms | −0.6% / −0.3% |
+| flush 20 万 wall | 379.0 / 378.0 ms | 377.5 / 378.2 ms | −0.4% / +0.1% |
+| merge 20 万 总耗时 | 253.1 / 253.0 ms | 253.5 / 252.7 ms | +0.2% / −0.1% |
+| encode collect（flush 500 万） | 4304.2 / 4445.6 ms | 4393.9 / 4377.0 ms | +2.1% / −1.5% |
+
+（本轮窗口的绝对值又比上一轮高 ~2.4x，仍是机器 load 所致，只看同窗口交替比。）
+
+### 背压实测（`bench/loadgen` 打 `/insert/jsonline`，8 s、8 并发、100 行/请求）
+
+| 配置 | RSS 峰值 | SIGTERM 退出 | `store_close` | 摄入 rows/s | 累计 stall | 503 |
+|---|---:|---:|---:|---:|---:|---:|
+| 默认（6M 行 / 1 GiB，`mem-wait` 2 s） | 3171 MB | 1942 ms | 1852.9 ms | 1.21M | 23.6 s | 0 |
+| 512 MiB（3M 行 / 512 MiB） | 1670 MB | 1120 ms | 987.0 ms | 1.03M | 30.4 s | 0 |
+| 512 MiB + `-mem-wait 100ms`（5 s） | — | 1127 ms | 1068.4 ms | 1.06M | 18.2 s | 168 |
+| cap 关闭（`-mem-max-rows 0 -mem-max-bytes 0`） | **>4096 MB @5.9 s（被强杀）** | — | — | 1.20M | — | — |
+
+- **RSS 有界**：默认 cap 8 s 峰值 3171 MB；同样配置跑到 20 s（23.3M 行）峰值
+  1761/1779 MB（512 MiB cap），**不随写入时长增长**。
+- **`store_close`**：默认 cap 1.85 s（其中 final flush 21 ms，其余是等后台线程把
+  手上的 part 写完）；512 MiB cap 0.99 s。“最多等一个进行中的 flush + 最后一次
+  flush”是设计上的上界。
+- **SIGTERM**：1.94 s / 1.12 s / 1.13 s，全部 ≤ 2 s；`stop` 置位后 merge 在 block
+  边界中止（`join` 耗时 253 ms）。
+- **吞吐**：HTTP 写入路径自身约 1.0–1.2M rows/s，cap 开/关没有差别。也就是说在这条
+  路径上"背压换稳定"没有额外代价；真正的取舍出现在库内批量 ingest（13M rows/s 级别），
+  那时摄入会被压到 flush 速率附近——这是有意为之。
+- **503 语义**：预算 100 ms 时 5 s 内 168 个批次被拒，`loadgen` 的 `max_ms` 只有
+  103 ms（不会挂住）。响应示例：
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Connection: close
+Retry-After: 1
+
+{"error":"memtable full","accepted":0,"rows":100,"errors":0}
+```
+
+### 新增指标（`/metrics`）
+
+| 指标 | 含义 |
+| --- | --- |
+| `oboe_mem_rows` / `oboe_mem_bytes` | 当前 memtable 的整库用量（`mem_rows` 复用已有指标） |
+| `oboe_mem_limit_rows` / `oboe_mem_limit_bytes` | 当前生效的上限（0 = 不限） |
+| `oboe_ingest_stalled_seconds_total` | 所有 ingest 批次在 cap 上累计等待的秒数（多线程求和） |
+| `oboe_mem_limit_rejected_total` | 等满 `mem_wait` 仍放不下而被拒绝（→503）的批次数 |
+
+`oboe_ingest_stalled_seconds_total` 是**线程累计时间**：8 并发各等 1 s 就是 +8。
+
+### 测试
+
+- `logdb.test_store_mem_cap_concurrent_ingest_flush`：cap 200 行、6 写线程 × 30 批 ×
+  40 行（7200 行）+ 同时 flush。断言行数守恒（`ingested_rows == 7200`、逐块回读
+  7200 行、无重复）、峰值 `mem_rows <= 200`、`stalled_ns > 0`、flush 后 memtable 清空、
+  `store_close < 2 s`。
+- `logdb.test_store_mem_cap_rejects_after_bounded_wait`：cap 100 行、无 flusher、
+  预算 200 ms。断言第二批被拒、等待落在 `[200ms, 700ms)`、`mem_limit_rejected == 1`、
+  已写入的 100 行仍在。
+- `logdb.test_store_mem_cap_shutdown_wakes_waiters`：填满后起一个 `mem_wait = 5s` 的
+  阻塞写线程，100 ms 后置 `stop` + 唤醒，断言写线程在 2 s 内退出。
+- `logdb.test_store_merge_aborts_on_shutdown`：`stop` 已置位时 `store_merge_partition`
+  必须不开始、part 数与行数不变、目录里没有半成品。
+- `web.test_dispatch_ingest_overload_503`：cap 1 行、`mem_wait 0`，三个写入端点都返回
+  503 + `Retry-After: 1`，行数仍为 0。
+
+### 回归
+
+- `odin build cmd` / `odin build bench` ✅；
+  `odin test tests -all-packages` **102 全绿**（96 基线 + golden + 本轮 5 个），
+  `-define:ODIN_STRESS=1` **106 全绿**。
+- `bench/run_matrix.sh --only small --reps 1 --no-soak`：EXIT=0、`failures.txt` 空、
+  无 `shutdown.log`；播种 36.2M rows/s、flush 5.52M rows/s，查询无退化。

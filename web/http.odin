@@ -37,6 +37,10 @@ Http_Response :: struct {
 	ctype: string,
 	extra: string,
 	body:  common.Buf,
+	// close_conn forces `Connection: close` even when the client asked for
+	// keep-alive. Ingest overload uses it so a stalled request does not tie up a
+	// session that the client is about to retry on anyway.
+	close_conn: bool,
 }
 
 Http_Request :: struct {
@@ -467,7 +471,7 @@ serve_connection :: proc(srv: ^Server, sock: net.TCP_Socket) {
 		sync.atomic_add(&srv.requests, 1)
 		arena: common.Arena
 		resp := dispatch(srv, &req, &arena)
-		sent := http_send(sock, resp.code, resp.ctype, resp.body.data[:], req.keep_alive, resp.extra)
+		sent := http_send(sock, resp.code, resp.ctype, resp.body.data[:], req.keep_alive && !resp.close_conn, resp.extra)
 		common.buf_destroy(&resp.body)
 		common.arena_destroy(&arena)
 		if req.body_owned != nil {

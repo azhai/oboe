@@ -29,6 +29,12 @@ metrics_values :: proc(body: string) -> (values: map[string]i64, malformed: int)
 		}
 		v, ok := strconv.parse_int(line[sp+1:], 10)
 		if !ok {
+			// Prometheus allows float samples (e.g. the stalled-seconds counter);
+			// keep the parser strict about the format but accept a decimal value.
+			if f, fok := strconv.parse_f64(line[sp+1:]); fok {
+				values[line[:sp]] = i64(f)
+				continue
+			}
 			malformed += 1
 			continue
 		}
@@ -58,7 +64,7 @@ metrics_snapshot :: proc(t: ^testing.T, env: Handlers_Test_Env, arena: ^common.A
 	return values
 }
 
-METRICS_NAMES :: [20]string{
+METRICS_NAMES :: [25]string{
 	"oboe_ingested_rows_total",
 	"oboe_ingested_bytes_total",
 	"oboe_queries_total",
@@ -67,6 +73,11 @@ METRICS_NAMES :: [20]string{
 	"oboe_parts",
 	"oboe_partitions",
 	"oboe_mem_rows",
+	"oboe_mem_bytes",
+	"oboe_mem_limit_rows",
+	"oboe_mem_limit_bytes",
+	"oboe_ingest_stalled_seconds_total",
+	"oboe_mem_limit_rejected_total",
 	"oboe_rows",
 	"oboe_disk_bytes",
 	"oboe_http_requests_total",

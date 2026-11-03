@@ -31,6 +31,15 @@ Store_Config :: struct {
 	// ingest_shards stripes a partition's memtable into this many independently
 	// locked append buffers. 0 picks a value from the logical core count.
 	ingest_shards:    int,
+	// mem_max_rows / mem_max_bytes bound the whole memtable (all partitions).
+	// An ingest batch reserves its rows and bytes before copying; when the
+	// reservation does not fit it waits up to mem_wait for a flush to free
+	// space, and rejects the batch if it still does not fit. 0 disables a cap.
+	mem_max_rows:  int,
+	mem_max_bytes: i64,
+	// mem_wait is the longest an ingest batch may block on the cap before the
+	// caller (the HTTP layer) turns it into 503 + Retry-After.
+	mem_wait:      time.Duration,
 }
 
 default_store_config :: proc() -> Store_Config {
@@ -46,6 +55,15 @@ default_store_config :: proc() -> Store_Config {
 		flush_threads = 0,
 		sort_threads = 0,
 		ingest_shards = 0,
+		// 1 GiB of memtable and 6M rows. The row cap is the smaller of the two
+		// for the measured ~165 B/row of the JSON corpus (6M rows ≈ 0.97 GiB),
+		// so both limits engage at the same order and either one alone is enough
+		// to bound RSS. They are 30x flush_max_rows, so a flush that keeps up
+		// never blocks ingest, and a flush that does not leaves at most ~1 GiB
+		// resident instead of growing without a ceiling.
+		mem_max_rows = 6_000_000,
+		mem_max_bytes = 1 << 30,
+		mem_wait = 2 * time.Second,
 	}
 }
 
@@ -128,6 +146,20 @@ Store :: struct {
 	merged_parts:   u64,
 	queries:        u64,
 	dropped_rows:   u64,
+	// store-wide memtable accounting, in rows and in row_bytes. Ingest adds its
+	// reservation before copying and a flush subtracts what it stole, so the
+	// sums never include a batch that was rejected.
+	mem_rows:  u64,
+	mem_bytes: i64,
+	// space_mu guards the reservation check-and-add against a concurrent flush
+	// subtracting, and is the mutex space_cond waits on. Lock order is
+	// `mu` -> `space_mu`: ingest takes space_mu on its own (never while holding
+	// mu), a flush takes mu and then space_mu. No cycle.
+	space_mu:   sync.Mutex,
+	space_cond: sync.Cond,
+	// metrics
+	ingest_stalled_ns: u64,
+	mem_limit_rejected: u64,
 }
 
 Ingest_Row :: struct {
@@ -295,12 +327,18 @@ store_worker :: proc(data: rawptr) {
 }
 
 store_close :: proc(s: ^Store) {
+	t_close := time.now()
 	sync.atomic_store(&s.stop, 1)
+	// Release cap-blocked writers first: they must not sit out mem_wait while we
+	// wait for the worker and the final flush.
+	wake_mem_waiters(s)
 	if s.worker != nil {
 		thread.join(s.worker)
 		s.worker = nil
 	}
+	flush_start := time.now()
 	store_flush_all(s)
+	flush_ns := time.since(flush_start)
 	sync.rw_mutex_lock(&s.mu)
 	for p in s.partitions {
 		for part in p.parts {
@@ -313,14 +351,87 @@ store_close :: proc(s: ^Store) {
 	}
 	delete(s.partitions)
 	sync.rw_mutex_unlock(&s.mu)
+	// Shutdown cost is dominated by draining the memtable, so log it: it is how
+	// operators check that the cap is keeping close bounded. stderr keeps the
+	// bench's `-json` stdout stream machine-readable.
+	fmt.fprintf(os.stderr, "oboe: store closed in %.1f ms (final flush %.1f ms, %d rows left)\n",
+		f64(time.since(t_close)) / 1e6, f64(flush_ns) / 1e6, sync.atomic_load(&s.mem_rows))
 	free(s)
 }
 
 // ---------------------------------------------------------------- ingestion
 
-store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
+// reserve_mem claims a batch's rows and bytes in the store-wide memtable
+// accounting, waiting up to max_wait for a flush to make room. The cap check and
+// the add both happen under space_mu, so a flush cannot subtract between them
+// and let two batches overfill by the same amount twice. Returns stalled=true
+// when it had to wait at all.
+reserve_mem :: proc(s: ^Store, rows: int, bytes: i64, max_wait: time.Duration) -> (ok: bool, stalled: bool) {
+	if rows <= 0 {
+		return true, false
+	}
+	wait := max_wait
+	if wait < 0 {
+		wait = 0
+	}
+	deadline := common.now_ns() + i64(wait)
+	limit_rows := i64(s.cfg.mem_max_rows)
+	limit_bytes := s.cfg.mem_max_bytes
+	sync.mutex_lock(&s.space_mu)
+	defer sync.mutex_unlock(&s.space_mu)
+	for {
+		if sync.atomic_load(&s.stop) != 0 {
+			// Shutting down: fail fast so every blocked writer drains instead of
+			// sitting out the full budget while store_close waits on it.
+			return false, stalled
+		}
+		used_rows := i64(sync.atomic_load(&s.mem_rows))
+		used_bytes := sync.atomic_load(&s.mem_bytes)
+		rows_fit := limit_rows <= 0 || used_rows + i64(rows) <= limit_rows
+		bytes_fit := limit_bytes <= 0 || used_bytes + bytes <= limit_bytes
+		if rows_fit && bytes_fit {
+			sync.atomic_add(&s.mem_rows, u64(rows))
+			sync.atomic_add(&s.mem_bytes, bytes)
+			return true, stalled
+		}
+		now := common.now_ns()
+		if now >= deadline {
+			return false, stalled
+		}
+		stalled = true
+		_ = sync.cond_wait_with_timeout(&s.space_cond, &s.space_mu, time.Duration(deadline - now))
+	}
+}
+
+// release_mem returns reserved space and wakes blocked ingests so they re-check
+// the cap. A flush calls it after stealing a memtable; ingest calls it when a
+// batch appended fewer rows than it reserved.
+release_mem :: proc(s: ^Store, rows: int, bytes: i64) {
+	if rows > 0 {
+		sync.atomic_sub(&s.mem_rows, u64(rows))
+	}
+	if bytes > 0 {
+		sync.atomic_sub(&s.mem_bytes, bytes)
+	}
+	sync.mutex_lock(&s.space_mu)
+	sync.cond_broadcast(&s.space_cond)
+	sync.mutex_unlock(&s.space_mu)
+}
+
+// wake_mem_waiters releases blocked ingests without changing the accounting;
+// store_close uses it so a cap-blocked writer returns immediately.
+wake_mem_waiters :: proc(s: ^Store) {
+	sync.mutex_lock(&s.space_mu)
+	sync.cond_broadcast(&s.space_cond)
+	sync.mutex_unlock(&s.space_mu)
+}
+
+// store_ingest_bounded is store_ingest with an explicit cap budget. `accepted`
+// is 0 when the batch was rejected because the memtable stayed full for the
+// whole `max_wait`; `stalled_ns` is how long the batch waited on the cap.
+store_ingest_bounded :: proc(s: ^Store, rows: []Ingest_Row, max_wait: time.Duration) -> (accepted: int, stalled_ns: i64, rejected: bool) {
 	if len(rows) == 0 {
-		return 0
+		return 0, 0, false
 	}
 	active := flush_profile_enabled()
 	t_entry := prof_stage_start(active)
@@ -332,8 +443,33 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 		}
 	}
 
+	// Reserve before taking the store lock: a cap wait must never be able to
+	// block a flush's exclusive lock, so the reservation finishes (or times
+	// out) first, and space_mu is released before mu is taken.
+	// row_bytes is a pure length sum, so this pass costs far less than the copy
+	// it protects, and it uses the same formula the memtable accounting uses,
+	// which keeps the flush subtraction exact.
+	add_bytes := i64(0)
+	for i in 0..<len(rows) {
+		add_bytes += row_bytes(&rows[i])
+	}
+	t_wait := time.now()
+	ok, stalled := reserve_mem(s, len(rows), add_bytes, max_wait)
+	if stalled {
+		stalled_ns = i64(time.since(t_wait))
+		sync.atomic_add(&s.ingest_stalled_ns, u64(stalled_ns))
+	}
+	if !ok {
+		sync.atomic_add(&s.mem_limit_rejected, 1)
+		if active {
+			sync.atomic_add(&flush_prof.ingest_total_ns, u64(time.since(t_entry)))
+		}
+		return 0, stalled_ns, true
+	}
+
 	// The store lock stays shared for the whole batch: it keeps partitions alive
 	// against retention, but concurrent batches no longer exclude each other.
+	t_lock_start := time.now()
 	sync.rw_mutex_shared_lock(&s.mu)
 	if !batch_partitions_present(s, rows) {
 		// A day without a partition is rare (first batch of a day), so the
@@ -350,7 +486,7 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	}
 	if active {
 		t_locked = time.now()
-		sync.atomic_add(&flush_prof.ingest_wait_ns, u64(time.since(t_entry)))
+		sync.atomic_add(&flush_prof.ingest_wait_ns, u64(time.since(t_lock_start)))
 		sync.atomic_add(&flush_prof.ingest_calls, 1)
 		sync.atomic_add(&flush_prof.ingest_rows, u64(len(rows)))
 	}
@@ -359,6 +495,7 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	// one append lock. The round-robin cursor spreads concurrent batches over
 	// different shards even when they all target the same partition.
 	total_bytes: i64
+	appended := 0
 	i := 0
 	for i < len(rows) {
 		day := common.utc_day(rows[i].ts)
@@ -366,17 +503,29 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 		if p := find_partition(s, day); p != nil {
 			idx := int(sync.atomic_add(&p.next_shard, u32(1))) % len(p.shards)
 			total_bytes += append_shard_rows(p, &p.shards[idx], rows[i:j], now)
+			appended += j - i
 		}
 		i = j
 	}
-	sync.atomic_add(&s.ingested_rows, u64(len(rows)))
+	sync.atomic_add(&s.ingested_rows, u64(appended))
 	sync.atomic_add(&s.ingested_bytes, u64(total_bytes))
 	sync.rw_mutex_shared_unlock(&s.mu)
+	// Give back what the reservation claimed but nothing appended (a day run
+	// whose partition disappeared); done after dropping mu to keep the lock
+	// order mu -> space_mu one-directional.
+	if appended < len(rows) {
+		release_mem(s, len(rows) - appended, add_bytes - total_bytes)
+	}
 	if active {
 		sync.atomic_add(&flush_prof.ingest_hold_ns, u64(time.since(t_locked)))
 		sync.atomic_add(&flush_prof.ingest_total_ns, u64(time.since(t_entry)))
 	}
-	return len(rows)
+	return appended, stalled_ns, false
+}
+
+store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
+	accepted, _, _ := store_ingest_bounded(s, rows, s.cfg.mem_wait)
+	return accepted
 }
 
 // batch_partitions_present reports whether every day in the batch already has a
@@ -498,6 +647,14 @@ append_mem_row :: proc(sh: ^Ingest_Shard, r: ^Ingest_Row) -> i64 {
 
 store_flush_due :: proc(s: ^Store) {
 	now := common.now_ns()
+	// Hard-cap pressure: once the memtable is over half of mem_max_*, flush
+	// everything with rows even if the normal triggers have not fired, so an
+	// ingest blocked on the cap gets space on the next worker tick instead of
+	// waiting for flush_interval or flush_max_rows.
+	limit_rows := i64(s.cfg.mem_max_rows)
+	limit_bytes := s.cfg.mem_max_bytes
+	pressure := (limit_rows > 0 && i64(sync.atomic_load(&s.mem_rows)) * 2 >= limit_rows) ||
+		(limit_bytes > 0 && sync.atomic_load(&s.mem_bytes) * 2 >= limit_bytes)
 	due: [dynamic]^Partition
 	sync.rw_mutex_shared_lock(&s.mu)
 	for p in s.partitions {
@@ -505,7 +662,7 @@ store_flush_due :: proc(s: ^Store) {
 		if n == 0 {
 			continue
 		}
-		if n >= s.cfg.flush_max_rows || sync.atomic_load(&p.mem_bytes) >= s.cfg.flush_max_bytes || now - sync.atomic_load(&p.since_ns) >= i64(s.cfg.flush_interval) {
+		if pressure || n >= s.cfg.flush_max_rows || sync.atomic_load(&p.mem_bytes) >= s.cfg.flush_max_bytes || now - sync.atomic_load(&p.since_ns) >= i64(s.cfg.flush_interval) {
 			append(&due, p)
 		}
 	}
@@ -549,6 +706,7 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	// Steal every shard's contents. Only the owning shard lock is taken, so an
 	// ingest batch appending to another shard never waits for this swap.
 	total := 0
+	stolen_bytes: i64
 	for &sh in p.shards {
 		sync.mutex_lock(&sh.mu)
 		n := len(sh.rows)
@@ -558,6 +716,7 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 			sync.atomic_sub(&p.mem_rows, u64(n))
 			sync.atomic_sub(&p.mem_bytes, sh.bytes)
 			total += n
+			stolen_bytes += sh.bytes
 			sh.rows = make([dynamic]Row, 0, 4096)
 			sh.arena = {}
 			sh.bytes = 0
@@ -566,6 +725,15 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	}
 	if sync.atomic_load(&p.mem_rows) == 0 {
 		sync.atomic_store(&p.since_ns, 0)
+	}
+	if total > 0 {
+		// Return the stolen space to the store-wide cap and wake any ingest
+		// blocked on it. Still under mu: the lock order is mu -> space_mu.
+		sync.mutex_lock(&s.space_mu)
+		sync.atomic_sub(&s.mem_rows, u64(total))
+		sync.atomic_sub(&s.mem_bytes, stolen_bytes)
+		sync.cond_broadcast(&s.space_cond)
+		sync.mutex_unlock(&s.space_mu)
 	}
 	sync.rw_mutex_unlock(&s.mu)
 	if active {
@@ -617,7 +785,13 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 		}
 		sync.rw_mutex_shared_lock(&s.mu)
 		now := common.now_ns()
-		_ = append_shard_rows(p, &p.shards[0], failed, now)
+		back_bytes := append_shard_rows(p, &p.shards[0], failed, now)
+		// The rows are live again, so put their space back in the cap. The flush
+		// just released it, which is why this must not be treated as overshoot.
+		sync.mutex_lock(&s.space_mu)
+		sync.atomic_add(&s.mem_rows, u64(len(failed)))
+		sync.atomic_add(&s.mem_bytes, back_bytes)
+		sync.mutex_unlock(&s.space_mu)
 		sync.rw_mutex_shared_unlock(&s.mu)
 		delete(failed)
 	}
@@ -682,6 +856,13 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 	}
 	sync.rw_mutex_shared_unlock(&s.mu)
 	if len(chosen) < 2 {
+		delete(chosen)
+		return
+	}
+	// A merge can run for many seconds; letting it finish on the way out is how a
+	// SIGTERM turns into a multi-second shutdown. Bail before doing any work, and
+	// again at every block boundary, so store_close waits for at most one block.
+	if sync.atomic_load(&s.stop) != 0 {
 		delete(chosen)
 		return
 	}
@@ -755,6 +936,18 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 		}
 		if pw.nblocks != nblocks_before {
 			merge_drop_pins(&pins)
+			if sync.atomic_load(&s.stop) != 0 {
+				// Shutdown: abandon the merged part. The source parts are still in
+				// place, so dropping this merge loses no data; the next start (or
+				// the next merge tick) redoes it.
+				for i in 0..<len(cursors) {
+					cursor_destroy(&cursors[i])
+				}
+				delete(cursors)
+				part_writer_abort(pw)
+				delete(chosen)
+				return
+			}
 		}
 		cursor_advance(&cursors[best], &pins)
 		any = false
@@ -916,7 +1109,11 @@ store_apply_retention :: proc(s: ^Store) {
 	delete(s.partitions)
 	s.partitions = kept
 	sync.rw_mutex_unlock(&s.mu)
+	released_rows: u64
+	released_bytes: i64
 	for p in removed {
+		released_rows += sync.atomic_load(&p.mem_rows)
+		released_bytes += sync.atomic_load(&p.mem_bytes)
 		for part in p.parts {
 			close_part(part)
 		}
@@ -927,6 +1124,11 @@ store_apply_retention :: proc(s: ^Store) {
 		free(p)
 	}
 	delete(removed)
+	// Dropping a partition drops whatever it still held in its memtable, so the
+	// store-wide cap accounting has to let go of it too.
+	if released_rows > 0 || released_bytes > 0 {
+		release_mem(s, int(released_rows), released_bytes)
+	}
 }
 
 Store_Stats :: struct {

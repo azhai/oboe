@@ -11,6 +11,8 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+import "../common"
+
 // ---------------------------------------------------------------- parameters
 
 Params :: struct {
@@ -38,6 +40,13 @@ Params :: struct {
 	sort_threads: int,
 	flush_threads: int,
 	ingest_shards: int,
+	// 0 disables the memtable cap. The harness drives the memtable on purpose
+	// (ingest mode fills it to measure raw append throughput and there is no
+	// HTTP layer to turn a stall into 503), so the production caps are off by
+	// default and only the backpressure probe turns them on.
+	mem_max_rows:  int,
+	mem_max_bytes: i64,
+	mem_wait:      time.Duration,
 }
 
 parse_params :: proc() -> Params {
@@ -63,6 +72,9 @@ parse_params :: proc() -> Params {
 		sort_threads = 0,
 		flush_threads = 0,
 		ingest_shards = 0,
+		mem_max_rows = 0,
+		mem_max_bytes = 0,
+		mem_wait = 2 * time.Second,
 	}
 	args := os.args
 	i := 1
@@ -149,6 +161,18 @@ parse_params :: proc() -> Params {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v); nok && n > 0 { p.ingest_shards = n }
 			}
+		case "-mem-max-rows":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n >= 0 { p.mem_max_rows = n }
+			}
+		case "-mem-max-bytes":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := common.parse_size_bytes(v); nok && n >= 0 { p.mem_max_bytes = n }
+			}
+		case "-mem-wait":
+			if v, ok := next_arg(args, &i); ok {
+				if d, dok := common.parse_duration_ns(v); dok && d >= 0 { p.mem_wait = time.Duration(d) }
+			}
 		case "-h", "-help", "--help":
 			print_usage()
 			os.exit(0)
@@ -202,7 +226,10 @@ print_usage :: proc() {
   -profile-reps  flush-profile repetitions per tier (default 3)
   -sort-threads  memtable sort threads, 0 = auto      (default 0)
   -flush-threads part encode/compress threads, 0 = auto (default 0)
-  -ingest-shards memtable stripes per partition, 0 = auto (default 0)`)
+  -ingest-shards memtable stripes per partition, 0 = auto (default 0)
+  -mem-max-rows memtable row cap for the backpressure probe, 0 = unlimited (default 0)
+  -mem-max-bytes memtable byte cap for the backpressure probe, 0 = unlimited (default 0)
+  -mem-wait max time an ingest batch may block on the cap (default 2s)`)
 }
 
 // ---------------------------------------------------------------- threads

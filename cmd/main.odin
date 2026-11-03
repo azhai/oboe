@@ -78,6 +78,9 @@ Flags (logs):
   -flush-threads <n>      threads encoding a part during flush (default: half the logical cores)
   -sort-threads <n>       threads sorting a memtable during flush (default: half the logical cores, max 4)
   -ingest-shards <n>      striped memtable append buffers per partition (default: logical cores, 4..16)
+  -mem-max-rows <n>       hard cap on memtable rows before ingest waits/503 (default 6000000, 0 = no cap)
+  -mem-max-bytes <size>   hard cap on memtable bytes, e.g. 512MB, 1GB (default 1GB, 0 = no cap)
+  -mem-wait <dur>         how long an insert may block on the cap before 503, e.g. 2s (default 2s)
 
 Flags (cache):
   -cache-size <size>      in-memory capacity, e.g. 256MB, 8GB (default 256MB, 0 = unlimited)
@@ -228,6 +231,24 @@ main :: proc() {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v, 10); nok && n > 0 {
 					store_cfg.ingest_shards = n
+				}
+			}
+		case "-mem-max-rows", "--mem-max-rows":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v, 10); nok && n >= 0 {
+					store_cfg.mem_max_rows = n
+				}
+			}
+		case "-mem-max-bytes", "--mem-max-bytes":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := common.parse_size_bytes(v); nok && n >= 0 {
+					store_cfg.mem_max_bytes = n
+				}
+			}
+		case "-mem-wait", "--mem-wait":
+			if v, ok := next_arg(args, &i); ok {
+				if d, dok := parse_duration_arg(v); dok && d >= 0 {
+					store_cfg.mem_wait = d
 				}
 			}
 		case "-stream-fields", "--stream-fields":

@@ -186,6 +186,7 @@ dispatch :: proc(srv: ^Server, req: ^Http_Request, arena: ^common.Arena) -> (res
 			return
 		}
 		resp.code = handle_jsonline(srv, req.body, params, arena, &resp.body)
+		mark_ingest_overload(&resp)
 	case "/insert/elasticsearch/_bulk", "/insert/elasticsearch":
 		if req.method != "POST" {
 			resp.code = 405
@@ -193,6 +194,7 @@ dispatch :: proc(srv: ^Server, req: ^Http_Request, arena: ^common.Arena) -> (res
 			return
 		}
 		resp.code = handle_elastic_bulk(srv, req.body, params, arena, &resp.body)
+		mark_ingest_overload(&resp)
 	case "/insert/loki/api/v1/push":
 		if req.method != "POST" {
 			resp.code = 405
@@ -200,6 +202,7 @@ dispatch :: proc(srv: ^Server, req: ^Http_Request, arena: ^common.Arena) -> (res
 			return
 		}
 		resp.code = handle_loki(srv, req.body, params, arena, &resp.body)
+		mark_ingest_overload(&resp)
 	case "/select/logsql/query":
 		resp.code = handle_query(srv, params, arena, &resp, &resp.body)
 	case "/select/logsql/field_names":
@@ -214,6 +217,21 @@ dispatch :: proc(srv: ^Server, req: ^Http_Request, arena: ^common.Arena) -> (res
 }
 
 // ---------------------------------------------------------------- ingest
+
+// mark_ingest_overload turns a 503 from the ingest handlers into the
+// retryable-overload shape shared by all three insert endpoints: a Retry-After
+// header (the HTTP layer writes it from resp.extra) and Connection: close so
+// the stalled session does not linger.
+mark_ingest_overload :: proc(resp: ^Http_Response) {
+	if resp.code != 503 {
+		return
+	}
+	resp.ctype = "application/json"
+	if len(resp.extra) == 0 {
+		resp.extra = "Retry-After: 1\r\n"
+	}
+	resp.close_conn = true
+}
 
 prepare_query_params :: proc(srv: ^Server, params: Params, arena: ^common.Arena) -> (msg_field, time_field: string, stream_fields: []string) {
 	msg_field = params_get_or(params, "_msg_field", "_msg")
@@ -263,8 +281,16 @@ ingest_json_line :: proc(srv: ^Server, lines: []string, msg_field, time_field: s
 			fields = fs,
 		})
 	}
-	logdb.store_ingest(srv.store, rows[:])
-	common.buf_addf(body, `{{"rows":%d,"errors":%d}}`, len(rows), errors)
+	accepted, _, rejected := logdb.store_ingest_bounded(srv.store, rows[:], srv.store.cfg.mem_wait)
+	if rejected {
+		// The memtable cap stayed full for the whole wait budget. Report it as a
+		// retryable overload instead of blocking the request indefinitely, and
+		// tell the client how much was not taken.
+		common.buf_reset(body)
+		common.buf_addf(body, `{{"error":"memtable full","accepted":0,"rows":%d,"errors":%d}}`, len(rows), errors)
+		return 503
+	}
+	common.buf_addf(body, `{{"rows":%d,"errors":%d}}`, accepted, errors)
 	return 200
 }
 
@@ -333,9 +359,15 @@ handle_elastic_bulk :: proc(srv: ^Server, body: []u8, params: Params, arena: ^co
 		expect_action = true
 	}
 	start := common.now_ns()
-	ingest_json_line(srv, docs[:], msg_field, time_field, stream_fields, arena, out)
+	code := ingest_json_line(srv, docs[:], msg_field, time_field, stream_fields, arena, out)
 	took := (common.now_ns() - start) / 1_000_000
 	common.buf_reset(out)
+	if code == 503 {
+		// Keep the _bulk response shape so Elasticsearch clients read it as a
+		// retryable error instead of a silent empty success.
+		common.buf_addf(out, `{{"took":%d,"errors":true,"items":[]}}`, took)
+		return 503
+	}
 	common.buf_addf(out, `{{"took":%d,"errors":false,"items":[]}}`, took)
 	return 200
 }
@@ -425,8 +457,13 @@ handle_loki :: proc(srv: ^Server, body: []u8, params: Params, arena: ^common.Are
 		delete(label_fields)
 		delete(names)
 	}
-	logdb.store_ingest(srv.store, rows[:])
+	_, _, rejected := logdb.store_ingest_bounded(srv.store, rows[:], srv.store.cfg.mem_wait)
 	common.buf_reset(out)
+	if rejected {
+		// Loki push has no per-batch status field, so the HTTP status carries it.
+		common.buf_string(out, `{"error":"memtable full","retry_after":1}`)
+		return 503
+	}
 	return 204
 }
 
@@ -723,6 +760,15 @@ handle_metrics :: proc(srv: ^Server, out: ^common.Buf) {
 	common.buf_addf(out, "oboe_parts %d\n", st.parts)
 	common.buf_addf(out, "oboe_partitions %d\n", st.partitions)
 	common.buf_addf(out, "oboe_mem_rows %d\n", st.mem_rows)
+	common.buf_addf(out, "oboe_mem_bytes %d\n", sync.atomic_load(&srv.store.mem_bytes))
+	common.buf_addf(out, "oboe_mem_limit_rows %d\n", srv.store.cfg.mem_max_rows)
+	common.buf_addf(out, "oboe_mem_limit_bytes %d\n", srv.store.cfg.mem_max_bytes)
+	common.buf_addf(out, "# HELP oboe_ingest_stalled_seconds_total Seconds ingest batches spent waiting on the memtable cap.\n")
+	common.buf_addf(out, "# TYPE oboe_ingest_stalled_seconds_total counter\n")
+	common.buf_addf(out, "oboe_ingest_stalled_seconds_total %.3f\n", f64(sync.atomic_load(&srv.store.ingest_stalled_ns)) / 1e9)
+	common.buf_addf(out, "# HELP oboe_mem_limit_rejected_total Insert batches rejected with 503 because the memtable cap stayed full.\n")
+	common.buf_addf(out, "# TYPE oboe_mem_limit_rejected_total counter\n")
+	common.buf_addf(out, "oboe_mem_limit_rejected_total %d\n", sync.atomic_load(&srv.store.mem_limit_rejected))
 	common.buf_addf(out, "oboe_rows %d\n", st.rows)
 	common.buf_addf(out, "oboe_disk_bytes %d\n", st.disk_bytes)
 	common.buf_addf(out, "oboe_http_requests_total %d\n", srv.requests)

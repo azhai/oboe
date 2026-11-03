@@ -172,3 +172,58 @@ test_store_reload_after_merge :: proc(t: ^testing.T) {
 	store_close(s)
 	os.remove_all(dir)
 }
+
+// A merge runs for many seconds on a large partition, so store_close must not
+// wait for one: with stop already set, store_merge_partition must decline and
+// leave every source part (and every row) in place.
+@(test)
+test_store_merge_aborts_on_shutdown :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("merge_abort")
+	defer delete(dir)
+	os.remove_all(dir)
+	cfg := default_store_config()
+	cfg.data_path = dir
+	cfg.flush_interval = 1 << 62
+	cfg.flush_max_rows = 100000
+	cfg.flush_max_bytes = 1 << 40
+	cfg.block_rows = 64
+	cfg.merge_threshold = 2
+	cfg.merge_max_rows = 1 << 40
+	s := store_init(cfg, false)
+	rows := make([]Ingest_Row, 400)
+	defer delete(rows)
+	fields := []Field{{name = "level", value = "info"}, {name = "service", value = "api"}}
+	base := i64(1_700_000_000_000_000_000)
+	for i in 0..<400 {
+		rows[i] = Ingest_Row{ts = base + i64(i) * 1_000_000, stream = u64(i % 2), msg = "merge abort", fields = fields}
+	}
+	store_ingest(s, rows[0:200])
+	store_flush_all(s)
+	store_ingest(s, rows[200:400])
+	store_flush_all(s)
+	st := store_stats(s)
+	testing.expect_value(t, st.rows, 400)
+	testing.expect(t, st.parts >= 2)
+	parts_before := st.parts
+
+	sync.rw_mutex_shared_lock(&s.mu)
+	p := s.partitions[0]
+	sync.rw_mutex_shared_unlock(&s.mu)
+	sync.atomic_store(&s.stop, 1)
+	store_merge_partition(s, p)
+
+	st = store_stats(s)
+	testing.expect_value(t, st.rows, 400)
+	testing.expect_value(t, st.parts, parts_before)
+	testing.expect(t, len(p.parts) >= 2, "merge must not start once the store is stopping")
+	// The declined merge must not leave a half-written part behind.
+	parts_dir := fmt.aprintf("%s/parts", p.dir)
+	defer delete(parts_dir)
+	entries, rerr := os.read_directory_by_path(parts_dir, -1, context.temp_allocator)
+	testing.expect(t, rerr == nil, "part directory must still be readable")
+	for e in entries {
+		testing.expect(t, e.type == .Directory, "no stray files in the parts directory")
+	}
+	store_close(s)
+	os.remove_all(dir)
+}
