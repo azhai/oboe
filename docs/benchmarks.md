@@ -431,7 +431,7 @@ counter 单调；185 秒共服务 1666 万次 HTTP 请求和 25.8 万次查询�
 3. `OUT=/tmp/oboe_matrix bench/run_matrix.sh`（完整）或加 `--quick`（冒烟）。
 4. `$OUT/results/summary.md` 即本节表格；`raw.jsonl` 可自行重算；
    `shutdown.log` 记录被 SIGKILL 的收尾。
-5. `odin test tests -all-packages` 应为 93 个测试全部通过。
+5. `odin test tests -all-packages` 应为 96 个测试全部通过。
 
 ## 写入刷盘并行化（P1–P6）
 
@@ -467,3 +467,13 @@ counter 单调；185 秒共服务 1666 万次 HTTP 请求和 25.8 万次查询�
 - P6 的取舍：重查询（全量 `count()`）与刷盘线程争 CPU，p50 362→566 ms、p99 728→1270 ms，
   换来写入吞吐 2.5× 提升；轻量查询 p99 5.08→4.65 ms。
 - `/metrics` 新增 `oboe_flush_rows_total`、`oboe_flush_ms_last`，可直接观察单次刷盘规模。
+
+P6 的引用计数与并发读写测试（`logdb/storage_more_test.odin`）：
+
+| 测试 | 验证点 |
+|---|---|
+| `test_part_refs_defer_close_until_release` | unlink 后目录保留、仍能解码块；最后一次 release 才 close 并删目录 |
+| `test_part_refs_multiple_readers` | 两个独立引用：第一次 release 不删目录，第二次才删 |
+| `test_part_unlink_without_readers` | 无引用时 unlink 立即清理，不必等 release |
+| `test_concurrent_query_and_merge` | 2 个读线程 + 12 轮摄入/flush/merge/2 轮合并；读侧断言“查询前已提交的行一个不少、无重复” |
+| `test_concurrent_query_and_retention` | 10 个过期分区被逐个移除；读侧断言每个分区要么整块可见、要么完全不可见，当日分区恒完整 |

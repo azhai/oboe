@@ -8,6 +8,7 @@ import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
+import "core:time"
 
 // Storage tests that need directories keep them unique per process and per test
 // so concurrent test runners never share state.
@@ -503,10 +504,83 @@ test_part_refs_defer_close_until_release :: proc(t: ^testing.T) {
 	testing.expect(t, !os.exists(part_dir), "last release must remove the directory")
 }
 
+// Two readers hold independent references: the first release must leave the
+// part (and its directory) intact, only the second may close it.
+@(test)
+test_part_refs_multiple_readers :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("part_refs_multi")
+	os.remove_all(dir)
+	defer delete(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	base, _ := common.parse_iso_ns("2026-10-26T00:00:00Z")
+	fields := []Field{{name = "level", value = "info"}}
+	rows := make([]Ingest_Row, 3)
+	for i in 0 ..< 3 {
+		rows[i] = Ingest_Row{ts = base + i64(i), stream = 1, msg = "multi", fields = fields}
+	}
+	store_ingest(s, rows)
+	store_flush_all(s)
+	delete(rows)
+
+	part := s.partitions[0].parts[0]
+	part_dir := strings.clone(part.dir)
+	defer delete(part_dir)
+
+	part_retain(part)
+	part_retain(part)
+	part_unlink(part)
+	clear(&s.partitions[0].parts)
+	testing.expect(t, os.exists(part_dir), "two readers must keep the directory alive")
+
+	d, ok := read_block(part, &part.index[0])
+	testing.expect(t, ok)
+	if ok {
+		testing.expect_value(t, d.nrows, 3)
+		decoded_destroy(&d)
+	}
+
+	part_release(part)
+	testing.expect(t, os.exists(part_dir), "the first release must not remove the directory")
+
+	part_release(part)
+	testing.expect(t, !os.exists(part_dir), "the last release must remove the directory")
+}
+
+// Without readers the unlink has nothing to wait for and must clean up
+// immediately.
+@(test)
+test_part_unlink_without_readers :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("part_unlink_now")
+	os.remove_all(dir)
+	defer delete(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	rows := []Ingest_Row{{ts = 1_700_000_000_000_000_000, stream = 1, msg = "drop me"}}
+	store_ingest(s, rows)
+	store_flush_all(s)
+	part := s.partitions[0].parts[0]
+	part_dir := strings.clone(part.dir)
+	defer delete(part_dir)
+
+	part_unlink(part)
+	clear(&s.partitions[0].parts)
+	testing.expect(t, !os.exists(part_dir), "an unreferenced part must be removed on unlink")
+}
+
 Part_Ref_Reader :: struct {
 	s:         ^Store,
 	stop:      ^u64,
 	committed: ^i64,
+	base:      i64,
 	failures:  ^i64,
 	alloc:     mem.Allocator,
 }
@@ -515,19 +589,25 @@ part_ref_reader :: proc(data: rawptr) {
 	ctx := cast(^Part_Ref_Reader)data
 	context.allocator = ctx.alloc
 	for sync.atomic_load(ctx.stop) == 0 {
+		// The watermark is read before the query: every row committed at that
+		// moment must be visible afterwards, and no row may appear twice even
+		// though flushes and merges swap memtables and parts underneath.
 		committed := sync.atomic_load(ctx.committed)
-		seen := make(map[i64]bool)
 		res := execute_query(ctx.s, &Query{}, 10_000)
-		// Every row committed before the snapshot must be visible, and no row
-		// may be seen twice while flushes and merges swap parts underneath.
-		if len(res.rows) < int(committed) {
-			sync.atomic_add(ctx.failures, 1)
-		}
+		seen := make(map[i64]bool)
 		for r in res.rows {
-			if r.ts in seen {
+			id := (r.ts - ctx.base) / 1_000_000
+			if id in seen {
 				sync.atomic_add(ctx.failures, 1)
 			}
-			seen[r.ts] = true
+			seen[id] = true
+		}
+		for id in i64(0) ..< committed {
+			if !(id in seen) {
+				// Report once per query so a broken snapshot cannot spin the counter.
+				sync.atomic_add(ctx.failures, 1)
+				break
+			}
 		}
 		delete(seen)
 		result_destroy(&res)
@@ -554,7 +634,7 @@ test_concurrent_query_and_merge :: proc(t: ^testing.T) {
 	committed := i64(0)
 	failures := i64(0)
 
-	ctx := Part_Ref_Reader{s = s, stop = &stop, committed = &committed, failures = &failures, alloc = context.allocator}
+	ctx := Part_Ref_Reader{s = s, stop = &stop, committed = &committed, base = base, failures = &failures, alloc = context.allocator}
 	readers := make([dynamic]^thread.Thread, 0, 2)
 	defer delete(readers)
 	for _ in 0 ..< 2 {
@@ -596,4 +676,127 @@ test_concurrent_query_and_merge :: proc(t: ^testing.T) {
 	testing.expect_value(t, sync.atomic_load(&failures), i64(0))
 	st := store_stats(s)
 	testing.expect_value(t, st.rows, const_rounds * const_rows)
+}
+
+Retention_Reader :: struct {
+	s:        ^Store,
+	stop:     ^u64,
+	failures: ^i64,
+	alloc:    mem.Allocator,
+	day_rows: int,
+	days:     int,
+	new_rows: int,
+}
+
+retention_reader :: proc(data: rawptr) {
+	ctx := cast(^Retention_Reader)data
+	context.allocator = ctx.alloc
+	for sync.atomic_load(ctx.stop) == 0 {
+		res := execute_query(ctx.s, &Query{}, 10_000)
+		seen := make(map[i64]bool)
+		counts := make(map[u64]int)
+		for r in res.rows {
+			if r.ts in seen {
+				sync.atomic_add(ctx.failures, 1)
+			}
+			seen[r.ts] = true
+			counts[r.stream] += 1
+		}
+		// Retention drops whole partitions under the exclusive lock, so a
+		// snapshot must contain either all rows of an old day or none of them.
+		for day in 0 ..< ctx.days {
+			n := counts[u64(day)]
+			if n != 0 && n != ctx.day_rows {
+				sync.atomic_add(ctx.failures, 1)
+			}
+		}
+		// The current-day partition is never expired.
+		if counts[u64(ctx.days)] != ctx.new_rows {
+			sync.atomic_add(ctx.failures, 1)
+		}
+		delete(counts)
+		delete(seen)
+		result_destroy(&res)
+	}
+}
+
+// Retention unlinks whole partitions while scans are reading them; a scan must
+// see each surviving partition complete, never a half-removed one.
+@(test)
+test_concurrent_query_and_retention :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("query_retention_race")
+	os.remove_all(dir)
+	defer delete(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	cfg.retention_days = 38
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	fields := []Field{{name = "level", value = "info"}}
+	now := common.now_ns()
+	old_base := now - 40 * common.DAY_NS
+	const_days :: 10
+	const_day_rows :: 100
+
+	// One expired partition per day, 39..30 days ago; `stream` is the day index
+	// so a reader can tell which partitions a snapshot contains.
+	for day in 0 ..< const_days {
+		day_ts := old_base + i64(day) * common.DAY_NS
+		rows := make([]Ingest_Row, const_day_rows)
+		for i in 0 ..< const_day_rows {
+			rows[i] = Ingest_Row{ts = day_ts + i64(i), stream = u64(day), msg = "old row", fields = fields}
+		}
+		store_ingest(s, rows)
+		store_flush_all(s)
+		delete(rows)
+	}
+	const_new_rows :: 90
+	new_rows := make([]Ingest_Row, const_new_rows)
+	for i in 0 ..< const_new_rows {
+		new_rows[i] = Ingest_Row{ts = now + i64(i), stream = u64(const_days), msg = "new row", fields = fields}
+	}
+	store_ingest(s, new_rows)
+	store_flush_all(s)
+	delete(new_rows)
+
+	stop := u64(0)
+	failures := i64(0)
+	ctx := Retention_Reader{
+		s        = s,
+		stop     = &stop,
+		failures = &failures,
+		alloc    = context.allocator,
+		day_rows = const_day_rows,
+		days     = const_days,
+		new_rows = const_new_rows,
+	}
+	readers := make([dynamic]^thread.Thread, 0, 2)
+	defer delete(readers)
+	for _ in 0 ..< 2 {
+		r := thread.create_and_start_with_data(&ctx, retention_reader, self_cleanup = false, name = "ret-reader")
+		if r != nil {
+			append(&readers, r)
+		}
+	}
+
+	// Each step retires the oldest remaining day, so the unlink races with the
+	// scans ten times instead of once. The store holds a copy of the config, so
+	// the cutoff is moved on s.cfg.
+	for round in 0 ..< const_days {
+		s.cfg.retention_days = 38 - round
+		store_apply_retention(s)
+		time.sleep(2 * time.Millisecond)
+	}
+
+	sync.atomic_store(&stop, 1)
+	for r in readers {
+		thread.join(r)
+		thread.destroy(r)
+	}
+
+	testing.expect_value(t, sync.atomic_load(&failures), i64(0))
+	st := store_stats(s)
+	testing.expect_value(t, st.rows, const_new_rows)
 }
