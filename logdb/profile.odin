@@ -27,6 +27,9 @@ Phase_Stats :: struct {
 	sorts:       u64,
 	// memtable order -> part order
 	sort_ns:     u64,
+	// the sort split into the per-stream partition and the per-range sorts
+	sort_scatter_ns: u64,
+	sort_segment_ns: u64,
 	// rows -> column arrays + bloom token hashing, and timestamp bounds
 	collect_ns:  u64,
 	// column arrays -> uncompressed block bytes
@@ -97,6 +100,11 @@ flush_prof_on: u32
 @(private)
 flush_prof: Flush_Profile
 
+// Guards the shared counters against parallel encode workers. Only touched by
+// the merge hook, which runs once per worker while profiling.
+@(private)
+flush_prof_mu: sync.Mutex
+
 flush_profile_enable :: proc(block_rows: int) {
 	flush_prof = {}
 	flush_prof.block_rows = u64(block_rows)
@@ -134,7 +142,18 @@ flush_profile_words :: proc(p: ^Flush_Profile) -> []u64 {
 // flush_profile_record_block keeps the per-block size distribution. Called once
 // per block, only while profiling.
 flush_profile_record_block :: proc(scope: Prof_Scope, nrows, raw, comp: int) {
-	ph := &flush_prof.phase[int(scope)]
+	phase_record_block(&flush_prof.phase[int(scope)], flush_prof.block_rows, nrows, raw, comp)
+}
+
+// flush_profile_record_local_block is the worker-thread form of the same
+// bookkeeping: parallel encoders accumulate into a private Phase_Stats and fold
+// it into the shared profile when the worker exits.
+flush_profile_record_local_block :: proc(local: ^Phase_Stats, nrows, raw, comp: int) {
+	phase_record_block(local, flush_prof.block_rows, nrows, raw, comp)
+}
+
+@(private)
+phase_record_block :: proc(ph: ^Phase_Stats, block_rows: u64, nrows, raw, comp: int) {
 	r := u64(nrows)
 	b := u64(raw)
 	ph.blocks += 1
@@ -154,9 +173,9 @@ flush_profile_record_block :: proc(scope: Prof_Scope, nrows, raw, comp: int) {
 		ph.max_raw = b
 	}
 	switch {
-	case flush_prof.block_rows > 0 && r >= flush_prof.block_rows:
+	case block_rows > 0 && r >= block_rows:
 		ph.row_hist[0] += 1
-	case flush_prof.block_rows > 0 && r * 2 >= flush_prof.block_rows:
+	case block_rows > 0 && r * 2 >= block_rows:
 		ph.row_hist[1] += 1
 	case:
 		ph.row_hist[2] += 1
@@ -174,6 +193,57 @@ flush_profile_record_block :: proc(scope: Prof_Scope, nrows, raw, comp: int) {
 		ph.size_hist[4] += 1
 	case:
 		ph.size_hist[5] += 1
+	}
+}
+
+// flush_profile_merge_phase folds a worker's private counters into the shared
+// profile. Only reached while profiling; the mutex keeps parallel encoders
+// from racing on the histogram counters.
+flush_profile_merge_phase :: proc(scope: Prof_Scope, src: ^Phase_Stats) {
+	if !flush_profile_enabled() {
+		return
+	}
+	sync.mutex_lock(&flush_prof_mu)
+	defer sync.mutex_unlock(&flush_prof_mu)
+	dst := &flush_prof.phase[int(scope)]
+	dst.blocks += src.blocks
+	dst.parts += src.parts
+	dst.rows += src.rows
+	dst.sorts += src.sorts
+	dst.sort_ns += src.sort_ns
+	dst.sort_scatter_ns += src.sort_scatter_ns
+	dst.sort_segment_ns += src.sort_segment_ns
+	dst.collect_ns += src.collect_ns
+	dst.serialize_ns += src.serialize_ns
+	dst.zlib_ns += src.zlib_ns
+	dst.bloom_finish_ns += src.bloom_finish_ns
+	dst.write_data_ns += src.write_data_ns
+	dst.write_bloom_ns += src.write_bloom_ns
+	dst.index_ns += src.index_ns
+	dst.finish_index_ns += src.finish_index_ns
+	dst.finish_meta_ns += src.finish_meta_ns
+	dst.finish_open_ns += src.finish_open_ns
+	dst.raw_bytes += src.raw_bytes
+	dst.comp_bytes += src.comp_bytes
+	dst.bloom_bytes += src.bloom_bytes
+	dst.data_bytes += src.data_bytes
+	if src.min_rows < dst.min_rows {
+		dst.min_rows = src.min_rows
+	}
+	if src.max_rows > dst.max_rows {
+		dst.max_rows = src.max_rows
+	}
+	if src.min_raw < dst.min_raw {
+		dst.min_raw = src.min_raw
+	}
+	if src.max_raw > dst.max_raw {
+		dst.max_raw = src.max_raw
+	}
+	for h, i in src.row_hist {
+		dst.row_hist[i] += h
+	}
+	for h, i in src.size_hist {
+		dst.size_hist[i] += h
 	}
 }
 

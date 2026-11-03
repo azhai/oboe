@@ -76,6 +76,7 @@ Flags (logs):
   -stream-fields <list>   comma-separated fields that identify a stream (default "level,service")
   -flush-interval <dur>   memtable flush interval, e.g. 1s, 500ms (default 1s)
   -flush-threads <n>      threads encoding a part during flush (default: half the logical cores)
+  -sort-threads <n>       threads sorting a memtable during flush (default: half the logical cores, max 4)
 
 Flags (cache):
   -cache-size <size>      in-memory capacity, e.g. 256MB, 8GB (default 256MB, 0 = unlimited)
@@ -214,6 +215,12 @@ main :: proc() {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v, 10); nok && n > 0 {
 					store_cfg.flush_threads = n
+				}
+			}
+		case "-sort-threads", "--sort-threads":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v, 10); nok && n > 0 {
+					store_cfg.sort_threads = n
 				}
 			}
 		case "-stream-fields", "--stream-fields":

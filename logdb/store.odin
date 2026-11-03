@@ -24,6 +24,10 @@ Store_Config :: struct {
 	// flush_threads is the number of threads encoding/compressing a part.
 	// 0 picks a value from the logical core count.
 	flush_threads:    int,
+	// sort_threads is the number of threads sorting a memtable by stream.
+	// 0 picks a value from the logical core count; small memtables always sort
+	// serially (see sort_rows_parallel).
+	sort_threads:     int,
 }
 
 default_store_config :: proc() -> Store_Config {
@@ -37,6 +41,7 @@ default_store_config :: proc() -> Store_Config {
 		merge_threshold = 8,
 		merge_max_rows = 4_000_000,
 		flush_threads = 0,
+		sort_threads = 0,
 	}
 }
 
@@ -53,6 +58,20 @@ resolve_flush_threads :: proc(requested: int) -> int {
 	}
 	n := logical / 2
 	return clamp(n, 2, 8)
+}
+
+// resolve_sort_threads caps the default at four: the sort is bandwidth bound,
+// and a flush only has one range per stream (four for the default stream
+// fields), so more threads would only add handoff cost.
+resolve_sort_threads :: proc(requested: int) -> int {
+	if requested > 0 {
+		return requested
+	}
+	_, logical, ok := info.cpu_core_count()
+	if !ok || logical <= 2 {
+		return 1
+	}
+	return clamp(logical / 2, 2, 4)
 }
 
 Mem_Part :: struct {
@@ -110,6 +129,7 @@ store_init :: proc(cfg: Store_Config, start_worker := true) -> ^Store {
 	s := new(Store)
 	s.cfg = cfg
 	s.cfg.flush_threads = resolve_flush_threads(cfg.flush_threads)
+	s.cfg.sort_threads = resolve_sort_threads(cfg.sort_threads)
 	os.make_directory_all(s.cfg.data_path)
 	partitions_dir := fmt.aprintf("%s/partitions", s.cfg.data_path)
 	os.make_directory_all(partitions_dir)
@@ -415,7 +435,7 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	}
 
 	t := prof_stage_start(active)
-	sort_rows(old_rows[:])
+	sort_rows_parallel(old_rows[:], s.cfg.sort_threads)
 	if active {
 		ph := &flush_prof.phase[int(Prof_Scope.Flush)]
 		ph.sort_ns += prof_stage_end(true, t)

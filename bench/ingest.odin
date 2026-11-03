@@ -106,6 +106,13 @@ store_config :: proc(dir: string) -> logdb.Store_Config {
 	return cfg
 }
 
+// apply_threads forwards the -sort-threads / -flush-threads switches, which
+// exist so the flush profile can compare serial and parallel runs.
+apply_threads :: proc(cfg: ^logdb.Store_Config, p: Params) {
+	cfg.sort_threads = p.sort_threads
+	cfg.flush_threads = p.flush_threads
+}
+
 // open_store loads an existing directory or seeds a fresh one. Seeding is
 // skipped when reuse is set; the directory is wiped otherwise.
 open_store :: proc(p: Params, reuse: bool) -> ^logdb.Store {
@@ -114,6 +121,7 @@ open_store :: proc(p: Params, reuse: bool) -> ^logdb.Store {
 		os.remove_all(dir)
 	}
 	cfg := store_config(dir)
+	apply_threads(&cfg, p)
 	s := logdb.store_init(cfg, !reuse)
 	if !reuse {
 		base_ts := common.now_ns() - SPREAD_NS

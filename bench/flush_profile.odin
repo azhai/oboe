@@ -74,6 +74,7 @@ profile_flush_run :: proc(p: Params, tier: string, rows, rep: int, enabled := tr
 
 	cfg := store_config(dir)
 	cfg.block_rows = p.block_rows
+	apply_threads(&cfg, p)
 	s := logdb.store_init(cfg, true)
 	base_ts := common.now_ns() - SPREAD_NS
 
@@ -113,6 +114,7 @@ profile_merge_run :: proc(p: Params, tier: string, rows, rep: int) -> Profile_Ru
 
 	cfg := store_config(dir)
 	cfg.block_rows = p.block_rows
+	apply_threads(&cfg, p)
 	s := logdb.store_init(cfg, false)
 	base_ts := common.now_ns() - SPREAD_NS
 
@@ -154,9 +156,10 @@ profile_merge_run :: proc(p: Params, tier: string, rows, rep: int) -> Profile_Ru
 profile_json_line :: proc(tier, scenario: string, rep: int, r: Profile_Run) {
 	ph := r.prof.phase[0]
 	fmt.printf(
-		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d}}`,
+		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"sort_scatter_ms":%.2f,"sort_segment_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d}}`,
 		scenario, tier, rep, r.rows, r.wall_ms, r.ingest_ms, r.drain_ms,
 		ph.blocks, f64(ph.zlib_ns)/1e6, f64(ph.sort_ns)/1e6,
+		f64(ph.sort_scatter_ns)/1e6, f64(ph.sort_segment_ns)/1e6,
 		f64(ph.write_data_ns+ph.write_bloom_ns)/1e6, f64(r.prof.flush_wait_ns)/1e6,
 		ph.raw_bytes, ph.comp_bytes,
 	)
@@ -175,8 +178,8 @@ profile_print_flush :: proc(p: Params, tier: string, rows: int, runs: []Profile_
 		ph.finish_index_ns + ph.finish_meta_ns + ph.finish_open_ns
 	waits := med.ingest_wait_ns + med.flush_wait_ns + med.flush_append_wait_ns
 
-	fmt.printf("\n=== flush %s: %d rows, %d reps, threads=%d batch=%d block_rows=%d ===\n",
-		tier, rows, len(runs), p.threads, p.batch, p.block_rows)
+	fmt.printf("\n=== flush %s: %d rows, %d reps, threads=%d batch=%d block_rows=%d sort_threads=%d flush_threads=%d (0=auto) ===\n",
+		tier, rows, len(runs), p.threads, p.batch, p.block_rows, p.sort_threads, p.flush_threads)
 	fmt.printf("  ingest %.1f ms (%.0f rows/s) | flush 累计 %.1f ms（%d 次） | drain+close %.1f ms（含 worker 退出等待） | wall %.1f ms | %d blocks | %.1f MiB raw -> %.1f MiB on disk (%.2fx)\n",
 		profile_median_f64(runs, .Ingest), profile_rows_per_s(rows, profile_median_f64(runs, .Ingest) * 1e6),
 		f64(med.flush_total_ns)/1e6, med.flush_calls,
@@ -186,6 +189,12 @@ profile_print_flush :: proc(p: Params, tier: string, rows: int, runs: []Profile_
 
 	fmt.printf("  %-24s %-8s %-10s %-7s %-11s %-12s %-8s\n", "阶段", "次数", "总耗时ms", "占比", "每blockµs", "rows/s", "压缩比")
 	stage_row("sort", ph.sorts, ph.sort_ns, lph.sort_ns, hph.sort_ns, 0, ph.rows, pipeline, 0, 0)
+	if ph.sort_scatter_ns > 0 || ph.sort_segment_ns > 0 {
+		fmt.printf("    └ 分组+散列 %.2f ms（%.0f%%），段内排序 %.2f ms（%.0f%%）；散列与回写约 %.0f MiB 行结构\n",
+			f64(ph.sort_scatter_ns)/1e6, profile_share(ph.sort_scatter_ns, ph.sort_ns),
+			f64(ph.sort_segment_ns)/1e6, profile_share(ph.sort_segment_ns, ph.sort_ns),
+			f64(ph.rows * size_of(logdb.Row))/(1<<20))
+	}
 	stage_row("encode:行→列+bloom哈希", blocks, ph.collect_ns, lph.collect_ns, hph.collect_ns, blocks, ph.rows, pipeline, 0, 0)
 	stage_row("encode:serialize", blocks, ph.serialize_ns, lph.serialize_ns, hph.serialize_ns, blocks, ph.rows, pipeline, 0, 0)
 	stage_row("zlib (level 1)", blocks, ph.zlib_ns, lph.zlib_ns, hph.zlib_ns, blocks, ph.rows, pipeline, ph.raw_bytes, ph.comp_bytes)

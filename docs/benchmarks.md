@@ -132,6 +132,7 @@ oboe_bench -mode flush-profile -data /tmp/d -profile-reps 3 -block-rows 8192
 | `-mode ingest\|query\|cache\|queue-tcp\|all\|flush-profile` | 子命令；`ingest` 默认写 `-data` |
 | `-rows` / `-threads` / `-batch` | 播种行数、并发线程、每批行数 |
 | `-profile-reps` / `-block-rows` | `flush-profile` 每档重复次数（默认 3）、每块行数（默认 8192） |
+| `-sort-threads` / `-flush-threads` | 覆盖刷盘的排序/编码线程数，0 = 按逻辑核自动；`flush-profile` 用它做串行与并行对照 |
 | `-reps` / `-warm` | 每类查询的测量次数与预热次数 |
 | `-ops` / `-ops-large` / `-value-size` | 缓存操作数、大值操作数、小值字节数 |
 | `-data` / `-keep` / `-reuse` | 数据目录；保留；复用已有数据 |
@@ -564,4 +565,111 @@ P1/P2 都不会消除它。
   P1 若改用更高压缩级别会同时抬高 zlib 占比，收益判断时要一起看。
 - 本轮所有绝对吞吐低于文档前面记录的 1.0–2.1M rows/s，原因是后台 load avg ≈ 9；
   同机重复三轮的 pipeline 为 4.06/5.75/5.91 s，说明份额结论稳定、绝对值不要跨机对比。
+
+## P2 并行排序（2026-11-03）
+
+### 结论
+
+- **sort 从 1810.8 ms 降到 411.4 ms（4.4x）**，500 万行；20 万行 83.0 → 28.4 ms（2.9x）。
+  远超「至少 1.3x」的目标，不需要报告「不可行」。
+- 收益一半来自**分区**、一半来自**线程**：先按 stream 分组让每个排序段变小（串行就快 1.37x，
+  因为整数组 200 MiB 的随机访问被切成 4 段，缓存命中更好），再由 4 条线程并行（再快 3.2x）。
+- 分区本身很便宜：5M 档「计数 + 稳定散列」41.7 ms，只占 sort 的 10%；回写还在段内排序之后。
+- 默认配置下（P1 并行编码 + P2 并行排序）端到端刷盘 wall **3106 → 1584 ms（1.96x）**，
+  整体 1.61M → 3.16M rows/s；sort 占 wall 从 58.3% 降到 26.0%。
+- 200k 档 wall 只快 1.14x，因为 322 ms 里有约 250 ms 是等 250 ms tick 的 drain；看刷盘累计是
+  116.0 → 71.3 ms（1.63x）。小档 < 100k 行退化为纯串行，不承担分区开销。
+- merge 不经过本次改动（merge 用串行 `part_writer_add`），数字与上轮持平。
+
+### 实现
+
+新增 `logdb/sort_pool.odin`，`store_flush_partition` 里把 `sort_rows` 换成
+`sort_rows_parallel(rows, s.cfg.sort_threads)`：
+
+1. 顺序扫一遍统计每条 stream 的行数（stream 只有几条，线性扫描优于逐行 map 查找；
+   超过 `SORT_MAX_STREAMS = 64` 时退回原整数组排序）；
+2. 按 stream id 升序算前缀区间，再**稳定**地把行散列到各区间（同一条 stream 内保持输入顺序）；
+3. 每个区间用同一套 in-place `sort_by(ts)` 排序，多个区间并发；最后按区间顺序回写。
+
+确定性来自「分区与线程数无关、每段用同一算法排同一份数据」，所以 `sort_threads` 取 1 或 N
+产出的 part 逐字节一致；不依赖稳定排序，也不引入 tie-break。段内比较器只比 `ts`，1 次比较
+只剩 1 次整数比较（原比较器每次都要先比 stream）。线程数由 `Store_Config.sort_threads`
+控制（`cmd -sort-threads`），`0` = `clamp(逻辑核/2, 2, 4)`；实际并发度再被区间数钳住，
+所以 4 条 stream 最多 4 路。
+
+`profile.odin` 的插桩保留，并补了两点：sort 拆成 `sort_scatter_ns` / `sort_segment_ns`
+两个子阶段；P1 的并行编码 worker 各自持有 `Phase_Stats`，退出时加锁合并，因此
+`flush-profile` 在默认配置下仍能给出逐 block 的 encode/zlib/bloom/写入拆分
+（注意：此时阶段耗时是**多线程累计**，`流水线合计` 会大于 wall，wall 单独给出）。
+
+### 前后对比（同一台机器、同一天、3 次中位数）
+
+sort 单项（`flush-profile` 里唯一不受并行编码影响的计时）：
+
+| tier | 改前（整数组 `sort_by`） | 改后 `-sort-threads 1`（分区串行） | 改后 `-sort-threads 4` | 相对改前 |
+|---|---:|---:|---:|---:|
+| 20 万行 | 83.0 ms | 67.4 ms | 28.4 ms | **2.9x** |
+| 500 万行 | 1810.8 ms | 1328.6 ms | 411.4 ms | **4.4x** |
+
+默认配置端到端（P1 并行编码 + P2 并行排序；改前为同分支 `57da6c4`，只含 P1）：
+
+| tier | 刷盘累计 ms | wall ms | 整体 rows/s | sort 占 wall |
+|---|---:|---:|---:|---:|
+| 20 万行 改前 | 116.0 | 366.2 | 0.55M | 22.7% |
+| 20 万行 改后 | 71.3 | 322.4 | 0.62M | 8.8% |
+| 500 万行 改前 | 2491.2 | 3106.0 | 1.61M | 58.3% |
+| 500 万行 改后 | 1082.8 | 1584.2 | 3.16M | 26.0% |
+
+改后 500 万行分阶段（多线程累计 3634.9 ms；616 块，平均 8117 行 / 988 KiB 原始 / 46 KiB 压缩，
+块分布与上轮一致，全部 ≤1 MiB）：
+
+| 阶段 | 次数 | 累计 ms | 占累计 | 每 block µs |
+|---|---:|---:|---:|---:|
+| sort | 2 | 411.37 | 11.3% | – |
+| └ 分组+散列 | 2 | 41.73 | 10% of sort | – |
+| └ 段内排序 | 2 | 360.90 | 88% of sort | – |
+| encode:行→列+bloom哈希 | 616 | 1557.27 | 42.8% | 2528.0 |
+| encode:serialize | 616 | 454.49 | 12.5% | 737.8 |
+| zlib (level 1) | 616 | 904.39 | 24.9% | 1468.2 |
+| bloom:finish | 616 | 296.50 | 8.2% | 481.3 |
+| write data+bloom | 616 | 7.56 | 0.2% | 12.3 |
+
+### 确认确定性
+
+新增 `logdb/sort_pool_test.odin`（5 个用例）：
+
+- 4 条均分流各 25%：`sort_threads` 1 与 4 逐行（ts/stream/msg）一致；
+- 一条 stream 占 90%、stream id 有空档（3..8 无数据）：一致；
+- 只有 16 个不同 ts、每条 stream 大量重复：1 / 3 / 4 线程两两一致；
+- 空表、单行、低于阈值的 1000 行：不崩、不乱；
+- 120k 行分别用 1 与 4 线程排序后各写一个 part，`data.bin` / `bloom.bin` / `index.bin`
+  逐字节相同。
+
+排序只在同一条 stream、同一个 ts 的并列行之间改变了相对次序（旧实现对整个数组跑
+pdqsort，并列次序本就取决于初始位置）；查询结果不受影响，跨线程数完全确定。
+
+### 回归
+
+- `odin build cmd` / `odin build bench` ✅；`odin test tests -all-packages` **94 全绿**
+  （87 基线 + P1 的 2 个 + P2 的 5 个），`-define:ODIN_STRESS=1` 98 全绿。
+- `bench -mode ingest`（8 线程，默认配置，3 次中位数）：20 万 7.83M → 7.14M rows/s、
+  500 万 9.36M → 9.27M（−1%，在重复间波动内）；刷盘尾部这次本来就受后台 worker 时机影响，
+  不用它做结论。
+- `bench/run_matrix.sh --only small --reps 1 --no-soak`：播种 10.07M rows/s、刷盘 4.73M rows/s，
+  所有 HTTP / 库内查询 / 缓存 / 队列格子 0 error。同一份数据、同样 8 线程跑两轮改前/改后二进制
+  对照库内查询：filter 6.94k–9.73k vs 9.36k–9.51k qps、stats 1.21k–1.37k vs 1.34k–1.36k qps、
+  sort 0.98k–0.99k vs 0.97k–1.00k qps（首轮是冷缓存，取区间看待），无退化。
+- `flush-profile` 自对照（prof on vs off，默认配置）：20 万 +0.4%，500 万 −8.6%（落在噪声内，
+  drain 里含 250 ms tick 等待）。
+
+### 已知边界
+
+- 并行度上限就是 stream 数：4 条 stream 最多 4 路，实测 500 万行 sort 4.4x 已经接近天花板；
+  若某个 partition 只有 1–2 条 stream 占绝对多数，收益会回落到约 1.1–2x。
+- 分区需要一块 `n * sizeof(Row)` 的临时数组（5M 行约 200 MiB），只在刷盘期间存在；memtable
+  无界堆积到 2000 万行时峰值会多出约 800 MiB，若要收紧内存应改成按 stream 流式散列。
+- 小于 100k 行不分区、不建线程，保持原整数组 `sort_by`。
+
+环境与上一节相同：Apple M4（10 逻辑核）、macOS/APFS、`odin build bench -o:speed`、无
+`-microarch`；所有对比都在同一天同一台机器上重测，避免跨轮的 load 差异。
 
