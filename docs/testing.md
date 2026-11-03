@@ -38,7 +38,7 @@ CI 门禁脚本按顺序执行上述构建与测试步骤：
 ```
 
 脚本依次执行：`odin build cmd`、默认测试、`ODIN_STRESS=1` 测试、`odin build bench`、
-`odin run examples/embed`。仓库当前没有可确认可用的 Odin 镜像或 Gitea action，因此未
+`odin build bench/loadgen`、`odin run examples/embed`。仓库当前没有可确认可用的 Odin 镜像或 Gitea action，因此未
 添加 `.gitea/workflows/ci.yml`；CI 环境就绪后直接调用该脚本即可。
 
 常用选项（通过 `-define:` 传给测试运行器）：
