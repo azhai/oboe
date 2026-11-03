@@ -412,13 +412,23 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	sync.rw_mutex_lock(&s.mu)
 	defer sync.rw_mutex_unlock(&s.mu)
 	now := common.now_ns()
+	// A batch almost always targets a single day (timestamps come from the same
+	// request or from `now`), so the day is computed and the partition looked up
+	// once per run of same-day rows instead of once per row. Reserving the
+	// memtable slice up front keeps appending from repeatedly reallocating it.
+	day: i64
+	p: ^Partition
 	for i in 0..<len(rows) {
 		r := &rows[i]
 		if r.ts <= 0 {
 			r.ts = now
 		}
-		day := common.utc_day(r.ts)
-		p := get_partition(s, day)
+		d := common.utc_day(r.ts)
+		if p == nil || d != day {
+			day = d
+			p = get_partition(s, day)
+			reserve(&p.mem.rows, len(p.mem.rows) + len(rows) - i)
+		}
 		append_mem_row(p, r, now)
 		total_bytes += i64(len(r.msg))
 		for f in r.fields {
