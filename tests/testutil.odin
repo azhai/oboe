@@ -277,7 +277,7 @@ web_test_runner :: proc(data: rawptr) {
 
 // web_test_start launches web.server_run on 127.0.0.1:0 and waits until the
 // ephemeral port accepts connections. Returns nil if the server never came up.
-web_test_start :: proc(prefix: string, max_body := web.HTTP_MAX_BODY, workers := 2) -> ^Web_Test_Env {
+web_test_start :: proc(prefix: string, max_body := web.HTTP_MAX_BODY, workers := 2, max_conns := web.DEFAULT_MAX_CONNS) -> ^Web_Test_Env {
 	env := new(Web_Test_Env)
 	env.dir = test_tmpdir(prefix)
 
@@ -299,6 +299,7 @@ web_test_start :: proc(prefix: string, max_body := web.HTTP_MAX_BODY, workers :=
 	srv_cfg := web.default_server_config()
 	srv_cfg.listen = "127.0.0.1:0"
 	srv_cfg.workers = workers
+	srv_cfg.max_conns = max_conns
 	srv_cfg.max_body = max_body
 	srv_cfg.stream_fields = store_cfg.stream_fields
 	env.srv = web.server_init(srv_cfg, env.store, env.cache, nil)

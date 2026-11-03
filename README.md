@@ -95,7 +95,8 @@ odin run examples/embed  # store/cache/queue 组合示例
 | --- | --- | --- |
 | `-data` | `./data` | 数据目录 |
 | `-listen` | `0.0.0.0:9428` | HTTP 监听地址 |
-| `-workers` | `8` | HTTP 工作线程数 |
+| `-workers` | `8` | HTTP 业务线程数（并发执行查询/写入的上限）；不等于连接数上限 |
+| `-max-conns` | `4096` | 同时打开的 HTTP 连接数上限；超出时立即回 `503` 并关闭，`0` 为不限。`4096 × 16 KiB ≈ 64 MiB` 接收缓冲 |
 | `-retention` | `30` | 保留天数；实际保留 N+1 个 UTC 日（含今天），`0` 表示永久 |
 | `-block-rows` | `8192` | 每个存储块的行数 |
 | `-merge-threshold` | `8` | 分区内 part 数达到该值时合并 |
@@ -277,7 +278,9 @@ printf 'put 0 0 60 5\r\nhello\r\nreserve-with-timeout 1\r\n' | nc 127.0.0.1 1130
 
 ## 并发模型
 
-- HTTP：`accept` 主循环 + 固定 worker 池，keep-alive，单连接顺序处理。
+- HTTP：单个事件循环线程负责 accept 与收发字节，固定 `-workers` 个业务线程只执行
+  完整请求；keep-alive，单连接顺序处理。连接总数由 `-max-conns` 限制（默认 4096），
+  越限的连接直接回 `503` 而不是排队等待。
 - 存储：读多写少，分区锁 + 后台 flush/merge/retention 线程。
 - 缓存：请求线程直接按桶加锁（读共享锁 / 写独占锁），大值走桶内独立 FIFO。
 - 队列：后台线程每 50ms 推进延迟 job、处理 TTR 超时；每个连接一个线程，

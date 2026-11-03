@@ -2,10 +2,10 @@
 
 oboe 的测试跟随所属包，分别位于 `common/`、`netio/`、`logdb/`、`cache/`、`queue/`、
 `web/` 下的 `*_test.odin`，使用 Odin 内置的 `core:testing` 测试运行器。
-默认套件共 **87 个用例**：库包 68 个（`common` 10、`logdb` 26、`cache` 13、
-`queue` 6、`netio` 1、`web` 12），`tests/` 的 socket 端到端 19 个（HTTP 11、Queue 8）。
+默认套件共 **90 个用例**：库包 68 个（`common` 10、`logdb` 26、`cache` 13、
+`queue` 6、`netio` 1、`web` 12），`tests/` 的 socket 端到端 22 个（HTTP 14、Queue 8）。
 并行执行，且在此构建下无内存泄漏或 bad-free 报告。
-`tests/stress_test.odin` 里的 4 个并发压力用例默认不参与编译，开启后共 **91 个**（见下文）。
+`tests/stress_test.odin` 里的 4 个并发压力用例默认不参与编译，开启后共 **94 个**（见下文）。
 
 ## 1. 运行
 
@@ -57,10 +57,10 @@ odin test tests -all-packages -define:ODIN_TEST_RANDOM_SEED=1
 `odin test` 默认开启内存跟踪。成功时输出只有一行：
 
 ```
-Finished 87 tests in 1.264304s. All tests were successful.
+Finished 90 tests in 1.264304s. All tests were successful.
 ```
 
-开启压力测试（`-define:ODIN_STRESS=1`）后为 `Finished 91 tests ...`。
+开启压力测试（`-define:ODIN_STRESS=1`）后为 `Finished 94 tests ...`。
 
 若出现 `+++ leak` 或 `bad free`，测试仍可能通过，但说明有分配未释放；这类问题应
 视为失败修复。
@@ -86,7 +86,7 @@ Finished 87 tests in 1.264304s. All tests were successful.
 | `cache/cache_test.odin` | 9 | 基本读写删、TTL 过期、容量/value/key 限制、桶内整代淘汰、条目上限、大值 FIFO、超桶预算的大值、快照保存/加载（几何校验、过期过滤、损坏文件）、4 线程并发读写 |
 | `cache/cache_file_more_test.odin` | 4 | 截断/半写快照拒绝、header 与压缩载荷损坏拒绝、几何参数不匹配、并发 save+load、过期项加载过滤 |
 | `queue/queue_test.odin` | 6 | 优先级与 reserve/delete、delay、TTR 超时重入、bury/release/kick、kick/pause、上限与断线回收 |
-| `tests/http_e2e_test.odin` | 11 | **真实 socket**：keep-alive 三次请求复用连接、chunked 请求体、`Expect: 100-continue`、gzip 请求体、body 上限 413 与恰好等于上限、超长 header 431、Content-Length 与 Transfer-Encoding 冲突 400、非法 chunk 400、OPTIONS/CORS 与 404/405、stop 释放端口 |
+| `tests/http_e2e_test.odin` | 14 | **真实 socket**：keep-alive 三次请求复用连接、chunked 请求体、`Expect: 100-continue`、gzip 请求体、body 上限 413 与恰好等于上限、超长 header 431、Content-Length 与 Transfer-Encoding 冲突 400、非法 chunk 400、OPTIONS/CORS 与 404/405、stop 释放端口、**同时打开的连接数超过 `-workers` 时全部得到响应**；**chunked 共享帧与解析器/HTTP 状态码分类一致（固定畸形语料 + 120 组随机输入）**；**`-max-conns=2` 时第 3 条连接回 503 并关闭，释放一条后又可连接** |
 | `tests/queue_e2e_test.odin` | 8 | **真实 socket**：put/reserve/delete、优先级、delay、TTR 超时重入、bury/release/kick、pause tube、use/watch/ignore/stats、断线回收 reserved |
 | `tests/stress_test.odin` | 4 | **按需**：并发写入 + 并发 flush/merge + 并发查询的最终一致性、缓存 8 线程读写删校验、缓存边写边保存并重载校验、队列 4 生产者/4 消费者恰一次投递 |
 

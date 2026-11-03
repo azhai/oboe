@@ -61,7 +61,8 @@ HTTP `dispatch` 不依赖真实 socket，因此可以在测试里直接调用。
 | `cache` | `cache/cache_file.odin` | 缓存快照的保存/加载、周期保存线程 |
 | `queue` | `queue/queue.odin` | job/tube 状态机与堆 |
 | `queue` | `queue/queue_server.odin` | beanstalkd 文本协议与连接管理 |
-| `web` | `web/http.odin` | TCP accept、worker 池、HTTP/1.1 请求解析与响应、超时 |
+| `web` | `web/http.odin` | HTTP/1.1 请求解析与响应构造、状态机、超时、server 生命周期 |
+| `web` | `web/nbio_server.odin` | `core:nbio` 事件循环：accept、连接缓冲、请求完整性判定、业务队列与异步写回 |
 | `web` | `web/handlers.odin` | 路由、三种写入协议、查询/字段名/字段值、缓存 HTTP API、Prometheus 指标 |
 | `web` | `web/ui.odin` / `web/ui.html` | 编译期内嵌的 Web UI |
 | `cmd` | `cmd/main.odin` | 命令行参数、组件创建/销毁、信号处理与优雅关闭、版本号 |
@@ -311,16 +312,46 @@ timestamps: nrows * i64
 
 ## 8. HTTP 并发模型
 
-- 主循环 `accept`，把连接放入队列（上限 2^18）并唤醒 worker；默认 8 个 worker。
-- 一个连接由固定 worker 顺序处理，支持 HTTP/1.1 keep-alive。
+- 连接与计算解耦。`server_run` 所在线程独占一个 `core:nbio` 事件循环，负责
+  accept、接收字节、判断请求是否完整并写回响应；同时在线连接数不再受
+  `-workers` 限制，改由 `-max-conns`（默认 4096）与 fd/内存约束。
+- 连接上限在循环线程判定（`on_accept` 里比较 `len(srv.live)`），发生在创建
+  `Http_Conn` 和投递业务任务之前。越限的 socket 立即收到 `503 Service Unavailable`
+  （`Connection: close`、`Retry-After: 1`、`{"error":"too many connections"}`），
+  发完即关闭；它不会进入 `live`，因此既不计入活跃连接 gauge，也不占用业务线程。
+  运维从 `oboe_http_conns_rejected_total` 能直接区分「被限流」与「服务故障」。
+- 可选连接上限的内存估算：每连接固定 16 KiB 接收缓冲，默认 `4096 × 16 KiB ≈ 64 MiB`，
+  尚未计入按需增长的 `raw`（当前请求字节）；请求体上限 256 MiB 只约束单个请求。
+- 事件循环只做 I/O，不做业务：请求（head + body）完整到达后才进入
+  `-workers` 个业务线程（默认 8）。业务线程在 `netio.Conn.src` 预填充缓冲上
+  复用原有 HTTP 解析路径，执行同步的 `logdb.execute`，再把响应字节交回循环
+  发送。因此 `-workers` 是**业务并发度**，也是 CPU 型查询的吞吐上限。
+- 缓冲区所有权：每个连接有一个循环侧 `Http_Conn`，内含 `raw`（当前请求的
+  head+body）和 16 KiB 接收缓冲；业务线程只在任务存活期间读取 `raw`，不写。
+  响应缓冲区由业务线程分配，随 nbio 发送操作移交给循环，在发送回调里释放。
+- 一个连接由事件循环顺序处理，支持 HTTP/1.1 keep-alive；发送成功后清空或
+  截取 `raw` 中下一请求的残留字节（兼容 pipelining），空闲 60 s 读超时关闭。
 - 支持 `Content-Length`、chunked、`Expect: 100-continue`、请求体 gzip 解压。
+  `100-continue` 由循环在 head 解析后、读取 body 前发出；请求头 64 KiB、
+  请求体 256 MiB 的上限同样在循环侧判定，超限请求不会进入业务线程。
+- chunked 帧只有一份实现：`netio/chunked.odin` 的 `chunk_frame`（纯函数 +
+  `Chunk_Framer` 增量状态）。循环用它判断「是否完整 / 需要更多 / 格式非法 / 超限」，
+  业务线程用同一个函数解码 payload，解析器不再自行推导 chunk 边界。因此同一输入
+  在两条路径上必然得到同一分类：`Bad_Format`（非法 size、chunk 后 CRLF 损坏、
+  帧行超长）→ `400`，`Too_Large`（累计解码量超过 `max_body`，在消费 payload
+  前按声明 size 判定）→ `413`。
 - 上限：请求头 64 KiB、请求体 256 MiB、空闲读超时 60 s、发送超时 30 s；
   开启 `TCP_NODELAY`。响应带宽松 CORS 头和 `Server: oboe`。
 - 上限错误不静默断连：请求头超限回 `431`，`Content-Length` 声明或 chunked 累计
   body 超限回 `413`，`Content-Length` 与 `Transfer-Encoding` 并存、非法 chunk
-  size/框架回 `400`；响应带 `Content-Length` 与 `Connection: close`，发送后关闭，
-  不再读取剩余 body。
+  size/框架回 `400`，连接数超 `-max-conns` 回 `503`；响应带 `Content-Length` 与
+  `Connection: close`，发送后关闭，不再读取剩余 body。
+- 关停：`server_request_stop` 仍然只原子置位 + close 监听 fd（异步信号安全）。
+  循环每 50 ms 检查停止标志，停止 accept、shutdown 所有连接以唤醒阻塞 I/O、
+  等待在途业务任务交回（上限 5 s），再关闭全部连接并释放 loop。
+  `server_stop` 只广播条件变量并 join 业务线程，不触碰循环拥有的状态。
 - `/health` 返回 `OK`，`/metrics` 输出 Prometheus 文本格式。
+- `queue_server` 仍是「accept 循环 + 每连接一个线程」，不受本节改动影响。
 
 ## 9. 并发不变量
 

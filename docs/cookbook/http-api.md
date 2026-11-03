@@ -51,7 +51,7 @@ URL 解码后的剩余路径。
 | `413` | 缓存 value 超过 `-cache-max-value`；请求体超过 256 MiB（`Content-Length` 声明或 chunked 累计） | `{"error":"value too large"}` / `{"error":"request body too large"}` |
 | `431` | 请求头超过 64 KiB | `{"error":"request header too large"}` |
 | `500` | `/cache/save` 写文件失败 | `{"error":"cache save failed"}` |
-| `503` | 缓存被关闭时访问缓存端点 | `{"error":"cache disabled"}` |
+| `503` | 缓存被关闭时访问缓存端点；同时打开的连接数超过 `-max-conns`（默认 4096，`0` 为不限），此时还会带 `Retry-After: 1` | `{"error":"cache disabled"}` / `{"error":"too many connections"}` |
 
 具体错误串：
 
@@ -66,6 +66,7 @@ URL 解码后的剩余路径。
   非法 chunk size / chunk 框架损坏）
 - 请求体超限：`{"error":"request body too large"}`
 - 请求头超限：`{"error":"request header too large"}`
+- 连接数超限：`{"error":"too many connections"}`（响应带 `Retry-After: 1`）
 
 ## 响应类型
 
@@ -149,6 +150,7 @@ scrape_configs:
 | 空闲读超时 | 60 s |
 | 发送超时 | 30 s |
 | HTTP worker | `-workers`，默认 8 |
+| HTTP 连接 | `-max-conns`，默认 4096（`0` 为不限） |
 | 排队连接 | 2^18 |
 | 压缩 | 请求体支持 `Content-Encoding: gzip` |
 | 分块 | 支持 `Transfer-Encoding: chunked` |
@@ -165,6 +167,7 @@ scrape_configs:
 | chunked 累计 body 超过 256 MiB（在读到超限 chunk 时判定） | `413` |
 | `Content-Length` 与 `Transfer-Encoding` 同时出现 | `400` |
 | 非法 chunk size 或 chunk 框架损坏 | `400` |
+| 同时打开的连接数超过 `-max-conns`（在 accept 后立即判定，不排队） | `503` |
 
 正常请求、keep-alive、chunked、`Expect: 100-continue` 与 gzip 行为不受影响。
 

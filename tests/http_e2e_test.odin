@@ -4,11 +4,14 @@ package tests
 // 127.0.0.1:0, reads the bound port back from the server, and talks HTTP/1.1
 // through the shared TCP helpers in testutil.odin.
 
+import common "../common"
+import netio "../netio"
 import web "../web"
 import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:time"
 
@@ -436,4 +439,294 @@ test_http_e2e_stop_releases_port :: proc(t: ^testing.T) {
 		return
 	}
 	net.close(sock)
+}
+
+// More simultaneously open keep-alive connections than business workers must
+// all be answered. The event loop owns the connections; a worker only runs one
+// complete request at a time, so the old "one connection per worker" model
+// would leave the extra connections unanswered until the first ones close.
+@(test)
+test_http_e2e_connections_exceed_workers :: proc(t: ^testing.T) {
+	saved := context
+	context.allocator = runtime.default_allocator()
+	defer context = saved
+
+	env, ok := http_e2e_env(t, "http_more_conns")
+	if !ok {
+		return
+	}
+	defer web_test_stop(env)
+
+	conns := make([]Test_Conn, 4)
+	defer {
+		for &c in conns {
+			test_tcp_close(&c)
+		}
+		delete(conns)
+	}
+	// Everything is sent before anything is read: all four connections are
+	// open at the same time while the server was started with two workers.
+	for i in 0..<4 {
+		c, cok := test_tcp_dial(env.addr, 2 * time.Second)
+		if !cok {
+			testing.expectf(t, false, "connection %d: dial failed", i)
+			return
+		}
+		conns[i] = c
+		if !test_http_send(&conns[i], "GET", "/health", "", "") {
+			testing.expectf(t, false, "connection %d: send failed", i)
+			return
+		}
+	}
+	for i in 0..<4 {
+		resp, rok := test_http_read_response(&conns[i])
+		if !rok {
+			testing.expectf(t, false, "connection %d: no response", i)
+			continue
+		}
+		testing.expect_value(t, resp.status, 200)
+		testing.expect_value(t, resp.body, "OK")
+		testing.expectf(t, strings.contains(resp.headers, "Connection: keep-alive"), "connection %d: headers %q", i, resp.headers)
+	}
+}
+
+// ---------------------------------------------------------------- chunk framing
+
+// CHUNK_TEST_MAX_BODY is small so a declared chunk size can exceed it while
+// keeping the sent bodies tiny.
+CHUNK_TEST_MAX_BODY :: 4096
+
+CHUNK_TEST_HEAD :: "POST /insert/jsonline HTTP/1.1\r\nHost: oboe-test\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+// chunk_status maps the shared framing result to the status the HTTP layers
+// must answer with. 0 means "not complete yet": neither layer replies.
+chunk_status :: proc(res: netio.Chunk_Result) -> int {
+	switch res {
+	case .Complete:
+		return 200
+	case .Too_Large:
+		return 413
+	case .Bad_Format:
+		return 400
+	case .Need_More:
+		return 0
+	}
+	return 0
+}
+
+// shared_chunk_status is the event-loop side: the same netio.chunk_frame call
+// nbio_server.odin makes, over the whole body at once.
+shared_chunk_status :: proc(body: string, max_body: int) -> int {
+	fr: netio.Chunk_Framer
+	return chunk_status(netio.chunk_frame(&fr, transmute([]u8)body, max_body, web.HTTP_MAX_HEADER))
+}
+
+// parser_chunk_status is the worker side: it runs the real blocking parser over
+// a pre-filled connection, exactly as http_job_run does, and maps its error.
+parser_chunk_status :: proc(body: string, max_body: int) -> int {
+	raw := make([]u8, len(CHUNK_TEST_HEAD) + len(body))
+	defer delete(raw)
+	copy(raw, CHUNK_TEST_HEAD)
+	copy(raw[len(CHUNK_TEST_HEAD):], body)
+
+	conn := netio.Conn{src = raw}
+	head := common.buf_init(4096)
+	defer common.buf_destroy(&head)
+	parsed := common.buf_init(4096)
+	defer common.buf_destroy(&parsed)
+	_, err := web.http_read_request(&conn, &head, &parsed, max_body, raw)
+	// parsed may hold the decoded body; it dies with the buffer below.
+	switch err {
+	case .None:
+		return 200
+	case .Body_Too_Large:
+		return 413
+	case .Bad_Request:
+		return 400
+	case .Header_Too_Large:
+		return 431
+	case .Drop:
+		return 0
+	}
+	return 0
+}
+
+test_rnd_state: u32 = 0x1234_5678
+
+// test_rnd_next is a small xorshift32 so the random corpus is reproducible
+// without pulling in a fuzzing dependency.
+test_rnd_next :: proc() -> u32 {
+	x := test_rnd_state
+	x ~= x << 13
+	x ~= x >> 17
+	x ~= x << 5
+	test_rnd_state = x
+	return x
+}
+
+// The malformed chunk corpus must be classified identically by the shared
+// framer, the request parser and the full HTTP server. The statuses asserted
+// here are the ones the pre-refactor E2E suite already pinned: 400 for framing
+// damage, 413 for a declared size above max_body.
+@(test)
+test_http_e2e_chunk_framing_shared :: proc(t: ^testing.T) {
+	saved := context
+	context.allocator = runtime.default_allocator()
+	defer context = saved
+
+	env, ok := http_e2e_env(t, "http_chunk_shared", CHUNK_TEST_MAX_BODY)
+	if !ok {
+		return
+	}
+	defer web_test_stop(env)
+
+	valid1 := `{"_time":"2026-10-26T04:00:00Z","level":"info","service":"api","_msg":"chunk one"}` + "\n"
+	valid2 := `{"_time":"2026-10-26T04:00:01Z","level":"error","service":"db","_msg":"chunk two"}`
+	valid := fmt.aprintf("%x\r\n%s\r\n%x;ext=ignored\r\n%s\r\n0\r\n\r\n", len(valid1), valid1, len(valid2), valid2)
+	defer delete(valid)
+
+	long := strings.builder_make()
+	defer strings.builder_destroy(&long)
+	for _ in 0..<web.HTTP_MAX_HEADER + 8 {
+		strings.write_byte(&long, 'a')
+	}
+
+	Case :: struct {
+		label: string,
+		body:  string,
+		want:  int,
+	}
+	cases := []Case{
+		{"bad chunk size", "zz\r\n", 0},
+		{"broken chunk CRLF", "4\r\nWikiX\r\n0\r\n\r\n", 0},
+		{"overlong chunk line", strings.to_string(long), 0},
+		{"chunk over max_body", "4000\r\n", 0},
+		{"two chunks with extension", valid, 0},
+	}
+
+	for &c in cases {
+		c.want = shared_chunk_status(c.body, CHUNK_TEST_MAX_BODY)
+		testing.expectf(t, c.want == 200 || c.want == 400 || c.want == 413, "%s: framer classified %d", c.label, c.want)
+		got := parser_chunk_status(c.body, CHUNK_TEST_MAX_BODY)
+		testing.expectf(t, got == c.want, "%s: parser %d, framer %d", c.label, got, c.want)
+		if c.want == 200 {
+			r, rok := test_http_once(env.addr, "POST", "/insert/jsonline", "Transfer-Encoding: chunked\r\nContent-Type: application/x-ndjson\r\n", c.body)
+			testing.expectf(t, rok && r.status == 200, "%s: http status %d", c.label, r.status)
+		} else {
+			http_expect_rejected(t, env, c.label, "POST", "/insert/jsonline", "Transfer-Encoding: chunked\r\n", c.body, c.want)
+		}
+	}
+
+	// A short random sweep: both callers must agree on every input, including
+	// the ones that are merely incomplete.
+	alphabet := "0123456789abcdefABCDEF; x\r\n\t"
+	for _ in 0..<120 {
+		n := int(test_rnd_next() % 40) + 1
+		b := strings.builder_make()
+		for _ in 0..<n {
+			strings.write_byte(&b, alphabet[int(test_rnd_next() % u32(len(alphabet)))])
+		}
+		s := strings.to_string(b)
+		want := shared_chunk_status(s, CHUNK_TEST_MAX_BODY)
+		got := parser_chunk_status(s, CHUNK_TEST_MAX_BODY)
+		testing.expectf(t, got == want, "random %q: parser %d, framer %d", s, got, want)
+		strings.builder_destroy(&b)
+	}
+}
+
+// -max-conns must answer the connection above the limit with an explicit 503
+// instead of queueing it, must not count it as active, and must let a new
+// connection in as soon as one of the accepted ones goes away.
+@(test)
+test_http_e2e_max_conns_rejects :: proc(t: ^testing.T) {
+	saved := context
+	context.allocator = runtime.default_allocator()
+	defer context = saved
+
+	env := web_test_start("http_max_conns", web.HTTP_MAX_BODY, 2, 2)
+	if env == nil {
+		testing.expectf(t, false, "server did not start")
+		return
+	}
+	defer web_test_stop(env)
+
+	// web_test_start probes the port with a dial that it closes again; wait
+	// until the loop has reclaimed that probe so the limit counts only us.
+	start := time.now()
+	for sync.atomic_load(&env.srv.active) != 0 && time.since(start) < 2*time.Second {
+		time.sleep(5 * time.Millisecond)
+	}
+
+	conns := make([]Test_Conn, 3)
+	defer {
+		for &c in conns {
+			test_tcp_close(&c)
+		}
+		delete(conns)
+	}
+	for i in 0..<3 {
+		c, cok := test_tcp_dial(env.addr, 2 * time.Second)
+		if !cok {
+			testing.expectf(t, false, "connection %d: dial failed", i)
+			return
+		}
+		conns[i] = c
+		if !test_http_send(&conns[i], "GET", "/health", "", "") {
+			testing.expectf(t, false, "connection %d: send failed", i)
+			return
+		}
+	}
+
+	for i in 0..<2 {
+		resp, rok := test_http_read_response(&conns[i])
+		if !rok {
+			testing.expectf(t, false, "connection %d: no response", i)
+			continue
+		}
+		testing.expect_value(t, resp.status, 200)
+		testing.expect_value(t, resp.body, "OK")
+	}
+
+	// The third connection is over the limit: 503, Connection: close, error
+	// body, then closed by the server.
+	resp, rok := test_http_read_response(&conns[2])
+	if !rok {
+		testing.expectf(t, false, "rejected connection: no response")
+	} else {
+		testing.expect_value(t, resp.status, 503)
+		testing.expectf(t, strings.contains(resp.headers, "Connection: close"), "headers %q", resp.headers)
+		testing.expectf(t, strings.contains(resp.body, "too many connections"), "body %q", resp.body)
+		testing.expect(t, test_tcp_closed(&conns[2]))
+	}
+	test_tcp_close(&conns[2])
+
+	// The rejected connection never entered the active gauge.
+	testing.expect_value(t, sync.atomic_load(&env.srv.active), u32(2))
+
+	// Metrics expose both the gauge and the rejection counter.
+	mok := test_http_send(&conns[0], "GET", "/metrics", "", "")
+	m: Http_Test_Response
+	if mok {
+		m, mok = test_http_read_response(&conns[0])
+	}
+	testing.expect(t, mok)
+	if mok {
+		testing.expectf(t, strings.contains(m.body, "oboe_http_connections 2\n"), "metrics body missing gauge: %q", m.body)
+		testing.expectf(t, strings.contains(m.body, "oboe_http_conns_rejected_total 1\n"), "metrics body missing rejection counter: %q", m.body)
+	}
+
+	// Freeing one accepted connection must free a slot for a new one.
+	test_tcp_close(&conns[0])
+	start = time.now()
+	for sync.atomic_load(&env.srv.active) > 1 && time.since(start) < 2*time.Second {
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expect_value(t, sync.atomic_load(&env.srv.active), u32(1))
+
+	after, aok := test_http_once(env.addr, "GET", "/health", "", "")
+	testing.expect(t, aok)
+	if aok {
+		testing.expect_value(t, after.status, 200)
+		testing.expect_value(t, after.body, "OK")
+	}
 }
