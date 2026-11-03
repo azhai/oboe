@@ -8,6 +8,7 @@ package logdb
 
 import "../common"
 import "core:mem"
+import "core:slice"
 import "core:sync"
 import "core:thread"
 
@@ -179,6 +180,120 @@ part_writer_add_encoded :: proc(pw: ^Part_Writer, out: Block_Out) -> bool {
 		pw.max_ts = out.max_ts
 	}
 	return true
+}
+
+// MERGE_WINDOW_BLOCKS bounds how many blocks a merge accumulates before
+// handing them to the parallel encoder. A window is 32 blocks (262k rows at the
+// default block size), which is plenty of work for the encoder while keeping
+// the copied rows and their strings to a few tens of megabytes.
+MERGE_WINDOW_BLOCKS :: 32
+
+// Part_Stream writes a single part from a stream of already sorted rows whose
+// source is decoded block by block (a merge). Rows are copied into a window
+// with their own arena because the cursors free their decoded blocks as they
+// advance; when the window fills up it goes through the same parallel
+// encode/write path as a flush, keeping the part's block layout identical.
+Part_Stream :: struct {
+	pw:         ^Part_Writer,
+	rows:       [dynamic]Row,
+	arena:      common.Arena,
+	block_rows: int,
+	threads:    int,
+	window:     int,
+	ok:         bool,
+}
+
+part_stream_begin :: proc(part_dir: string, block_rows, threads: int) -> Part_Stream {
+	ps := Part_Stream{}
+	ps.pw = part_writer_begin(part_dir, block_rows, false)
+	if ps.pw == nil {
+		return ps
+	}
+	ps.block_rows = block_rows
+	ps.threads = threads
+	ps.window = max(block_rows, MERGE_WINDOW_BLOCKS * block_rows)
+	ps.rows = make([dynamic]Row, 0, 4096)
+	ps.ok = true
+	return ps
+}
+
+part_stream_add :: proc(ps: ^Part_Stream, row: Row) -> bool {
+	if !ps.ok {
+		return false
+	}
+	fields := common.arena_alloc(&ps.arena, len(row.fields) * size_of(Field), align_of(Field))
+	fs := slice.from_ptr(cast(^Field)raw_data(fields), len(row.fields))
+	for i in 0..<len(row.fields) {
+		fs[i] = Field{
+			name  = common.arena_str(&ps.arena, row.fields[i].name),
+			value = common.arena_str(&ps.arena, row.fields[i].value),
+		}
+	}
+	append(&ps.rows, Row{
+		ts     = row.ts,
+		stream = row.stream,
+		msg    = common.arena_str(&ps.arena, row.msg),
+		fields = fs,
+	})
+	if len(ps.rows) >= ps.window {
+		return part_stream_flush(ps)
+	}
+	return true
+}
+
+part_stream_flush :: proc(ps: ^Part_Stream) -> bool {
+	if !ps.ok {
+		return false
+	}
+	if len(ps.rows) == 0 {
+		return true
+	}
+	spans := block_spans(ps.rows[:], ps.block_rows)
+	if len(spans) == 0 {
+		delete(spans)
+		return true
+	}
+	defer delete(spans)
+	outs := make([]Block_Out, len(spans))
+	defer delete(outs)
+	ok := encode_blocks(ps.rows[:], spans, outs, ps.threads)
+	if ok {
+		for i in 0..<len(spans) {
+			if !part_writer_add_encoded(ps.pw, outs[i]) {
+				ok = false
+				break
+			}
+		}
+	}
+	release_block_outs(outs)
+	ps.ok = ok
+	clear(&ps.rows)
+	common.arena_reset(&ps.arena)
+	return ok
+}
+
+part_stream_finish :: proc(ps: ^Part_Stream) -> (^Disk_Part, bool) {
+	if !ps.ok || !part_stream_flush(ps) {
+		part_stream_abort(ps)
+		return nil, false
+	}
+	part, ok := part_writer_finish(ps.pw)
+	part_stream_destroy(ps)
+	return part, ok
+}
+
+part_stream_abort :: proc(ps: ^Part_Stream) {
+	if ps.pw != nil {
+		part_writer_abort(ps.pw)
+	}
+	part_stream_destroy(ps)
+}
+
+part_stream_destroy :: proc(ps: ^Part_Stream) {
+	delete(ps.rows)
+	common.arena_destroy(&ps.arena)
+	ps.pw = nil
+	ps.ok = false
 }
 
 // write_part_parallel writes a part using `threads` encode threads. Rows must

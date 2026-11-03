@@ -58,11 +58,13 @@ metrics_snapshot :: proc(t: ^testing.T, env: Handlers_Test_Env, arena: ^common.A
 	return values
 }
 
-METRICS_NAMES :: [20]string{
+METRICS_NAMES :: [22]string{
 	"oboe_ingested_rows_total",
 	"oboe_ingested_bytes_total",
 	"oboe_queries_total",
 	"oboe_flushed_parts_total",
+	"oboe_flush_rows_total",
+	"oboe_flush_ms_last",
 	"oboe_merged_parts_total",
 	"oboe_parts",
 	"oboe_partitions",

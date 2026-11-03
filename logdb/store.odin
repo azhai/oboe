@@ -80,6 +80,13 @@ Store :: struct {
 	ingested_rows:  u64,
 	ingested_bytes: u64,
 	flushed_parts:  u64,
+	// flushed_rows and flush_ms_last describe the most recent flush, so
+	// operators can tell whether the flush size is bounded by flush_max_rows.
+	flushed_rows:  u64,
+	flush_ms_last: u64,
+	// mem_rows counts the rows waiting in memtables. Ingest uses it to apply
+	// backpressure once the backlog outgrows what a single flush can drain.
+	mem_rows:       u64,
 	merged_parts:   u64,
 	queries:        u64,
 	dropped_rows:   u64,
@@ -334,14 +341,26 @@ store_worker :: proc(data: rawptr) {
 		store_flush_due(s)
 		now := common.now_ns()
 		if now - last_merge >= 10 * 1_000_000_000 {
-			store_merge_all(s)
+			// Flushes come first: while a memtable is due, a full merge round
+			// only delays the flush that ingest is already waiting on. Still
+			// merge one partition so parts cannot pile up forever under
+			// sustained load.
+			max_partitions := 0
+			if store_flush_pending(s) {
+				max_partitions = 1
+			}
+			store_merge_all(s, max_partitions)
 			last_merge = now
 		}
 		if now - last_retention >= 60 * 1_000_000_000 {
 			store_apply_retention(s)
 			last_retention = now
 		}
-		time.sleep(250 * time.Millisecond)
+		// Poll often so a memtable is swapped out as soon as it crosses
+		// flush_max_rows. With a long poll interval the whole backlog is swapped
+		// at once, which makes each flush grow with ingest rate instead of
+		// staying bounded by the configured threshold.
+		time.sleep(5 * time.Millisecond)
 	}
 }
 
@@ -370,9 +389,24 @@ store_close :: proc(s: ^Store) {
 
 // ---------------------------------------------------------------- ingestion
 
+// MEM_BACKLOG_MAX_FACTOR bounds the memtable backlog in units of flush_max_rows.
+// The flush worker swaps a memtable and then encodes it; rows ingested while
+// that runs land in the next memtable. With no limit the backlog grows by
+// roughly (ingest rate / flush rate) every cycle until the machine runs out of
+// memory, so ingest waits once it reaches this multiple.
+MEM_BACKLOG_MAX_FACTOR :: 4
+
 store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	if len(rows) == 0 {
 		return 0
+	}
+	// Only throttle when a background worker exists; embedders drive
+	// store_flush_all themselves and must not block here.
+	if s.worker != nil && s.cfg.flush_max_rows > 0 {
+		limit := u64(s.cfg.flush_max_rows * MEM_BACKLOG_MAX_FACTOR)
+		for sync.atomic_load(&s.mem_rows) > limit && sync.atomic_load(&s.stop) == 0 {
+			time.sleep(1 * time.Millisecond)
+		}
 	}
 	total_bytes: i64
 	sync.rw_mutex_lock(&s.mu)
@@ -391,6 +425,7 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 			total_bytes += i64(len(f.name) + len(f.value))
 		}
 	}
+	sync.atomic_add(&s.mem_rows, u64(len(rows)))
 	sync.atomic_add(&s.ingested_rows, u64(len(rows)))
 	sync.atomic_add(&s.ingested_bytes, u64(total_bytes))
 	return len(rows)
@@ -442,16 +477,20 @@ append_mem_row :: proc(p: ^Partition, r: ^Ingest_Row, now: i64) {
 
 // ---------------------------------------------------------------- flush
 
+store_partition_due :: proc(s: ^Store, p: ^Partition, now: i64) -> bool {
+	n := len(p.mem.rows)
+	if n == 0 {
+		return false
+	}
+	return n >= s.cfg.flush_max_rows || p.mem.bytes >= s.cfg.flush_max_bytes || now - p.mem.since_ns >= i64(s.cfg.flush_interval)
+}
+
 store_flush_due :: proc(s: ^Store) {
 	now := common.now_ns()
 	due: [dynamic]^Partition
 	sync.rw_mutex_shared_lock(&s.mu)
 	for p in s.partitions {
-		n := len(p.mem.rows)
-		if n == 0 {
-			continue
-		}
-		if n >= s.cfg.flush_max_rows || p.mem.bytes >= s.cfg.flush_max_bytes || now - p.mem.since_ns >= i64(s.cfg.flush_interval) {
+		if store_partition_due(s, p, now) {
 			append(&due, p)
 		}
 	}
@@ -460,6 +499,21 @@ store_flush_due :: proc(s: ^Store) {
 		store_flush_partition(s, p)
 	}
 	delete(due)
+}
+
+// store_flush_pending reports whether any memtable is due, without flushing it.
+store_flush_pending :: proc(s: ^Store) -> bool {
+	now := common.now_ns()
+	pending := false
+	sync.rw_mutex_shared_lock(&s.mu)
+	for p in s.partitions {
+		if store_partition_due(s, p, now) {
+			pending = true
+			break
+		}
+	}
+	sync.rw_mutex_shared_unlock(&s.mu)
+	return pending
 }
 
 store_flush_all :: proc(s: ^Store) {
@@ -473,7 +527,14 @@ store_flush_all :: proc(s: ^Store) {
 	delete(all)
 }
 
+// store_flush_partition swaps the whole memtable and writes it out in parts of
+// at most flush_max_rows rows. A memtable can grow far past flush_max_rows
+// while a previous flush runs (or after a burst), and sorting/encoding it as
+// one unit is both slower per row and unbounded in peak memory. Writing
+// bounded chunks keeps every part at the configured size and keeps the sort
+// scratch buffer and encoder working sets small.
 store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
+	begin := common.now_ns()
 	sync.rw_mutex_lock(&s.mu)
 	if len(p.mem.rows) == 0 {
 		sync.rw_mutex_unlock(&s.mu)
@@ -483,42 +544,68 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 	old_arena := p.mem.arena
 	p.mem = Mem_Part{rows = make([dynamic]Row, 0, 4096)}
 	sync.rw_mutex_unlock(&s.mu)
+	sync.atomic_sub(&s.mem_rows, u64(len(old_rows)))
 
-	sort_rows(old_rows[:])
-	seq := sync.atomic_add(&s.seq, u64(1))
-	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
-	part, ok := write_part_parallel(part_dir, old_rows[:], s.cfg.block_rows, s.cfg.flush_threads)
-	delete(part_dir)
-	if ok {
+	chunk := s.cfg.flush_max_rows
+	if chunk <= 0 {
+		chunk = len(old_rows)
+	}
+	// done counts the rows already written to durable parts; only the rest is
+	// restored into the memtable if a chunk fails.
+	done := 0
+	for done < len(old_rows) {
+		n := min(chunk, len(old_rows) - done)
+		rows := old_rows[done:done + n]
+		sort_rows(rows, s.cfg.flush_threads)
+		seq := sync.atomic_add(&s.seq, u64(1))
+		part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
+		part, ok := write_part_parallel(part_dir, rows, s.cfg.block_rows, s.cfg.flush_threads)
+		delete(part_dir)
+		if !ok {
+			fmt.eprintf("oboe: flush failed for %s (%d of %d rows)\n", p.dir, n, len(old_rows))
+			break
+		}
 		sync.rw_mutex_lock(&s.mu)
 		append(&p.parts, part)
 		sync.rw_mutex_unlock(&s.mu)
 		sync.atomic_add(&s.flushed_parts, 1)
-	} else {
-		fmt.eprintf("oboe: flush failed for %s (%d rows)\n", p.dir, len(old_rows))
+		sync.atomic_add(&s.flushed_rows, u64(n))
+		done += n
+	}
+	if done < len(old_rows) {
 		sync.rw_mutex_lock(&s.mu)
 		now := common.now_ns()
-		for i in 0..<len(old_rows) {
+		for i in done ..< len(old_rows) {
 			r := &old_rows[i]
 			append_mem_row(p, &Ingest_Row{ts = r.ts, stream = r.stream, msg = r.msg, fields = r.fields}, now)
 		}
 		sync.rw_mutex_unlock(&s.mu)
+		sync.atomic_add(&s.mem_rows, u64(len(old_rows) - done))
 	}
 	common.arena_destroy(&old_arena)
 	delete(old_rows)
-	return ok
+	sync.atomic_store(&s.flush_ms_last, u64((common.now_ns() - begin) / 1_000_000))
+	return done == len(old_rows)
 }
 
 // ---------------------------------------------------------------- merge
 
-store_merge_all :: proc(s: ^Store) {
+// store_merge_all merges partitions that have accumulated merge_threshold
+// parts. max_partitions > 0 caps how many partitions are merged in this round,
+// which keeps a merge from monopolising the worker while flushes are pending.
+store_merge_all :: proc(s: ^Store, max_partitions := 0) {
 	sync.rw_mutex_shared_lock(&s.mu)
 	candidates := make([]^Partition, len(s.partitions))
 	copy(candidates, s.partitions[:])
 	sync.rw_mutex_shared_unlock(&s.mu)
+	merged := 0
 	for p in candidates {
+		if max_partitions > 0 && merged >= max_partitions {
+			break
+		}
 		if len(p.parts) >= s.cfg.merge_threshold {
 			store_merge_partition(s, p)
+			merged += 1
 		}
 	}
 	delete(candidates)
@@ -565,8 +652,8 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 	seq := sync.atomic_add(&s.seq, u64(1))
 	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
 	defer delete(part_dir)
-	pw := part_writer_begin(part_dir, s.cfg.block_rows, true)
-	if pw == nil {
+	ps := part_stream_begin(part_dir, s.cfg.block_rows, s.cfg.flush_threads)
+	if !ps.ok {
 		delete(chosen)
 		return
 	}
@@ -592,12 +679,12 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 		if best < 0 {
 			break
 		}
-		if !part_writer_add(pw, cursors[best].row) {
+		if !part_stream_add(&ps, cursors[best].row) {
 			for i in 0..<len(cursors) {
 				cursor_destroy(&cursors[i])
 			}
 			delete(cursors)
-			part_writer_abort(pw)
+			part_stream_abort(&ps)
 			delete(chosen)
 			return
 		}
@@ -614,7 +701,7 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 		cursor_destroy(&cursors[i])
 	}
 	delete(cursors)
-	part, ok := part_writer_finish(pw)
+	part, ok := part_stream_finish(&ps)
 	if !ok {
 		delete(chosen)
 		return
@@ -733,6 +820,7 @@ store_apply_retention :: proc(s: ^Store) {
 	s.partitions = kept
 	sync.rw_mutex_unlock(&s.mu)
 	for p in removed {
+		sync.atomic_sub(&s.mem_rows, u64(len(p.mem.rows)))
 		for part in p.parts {
 			close_part(part)
 		}
