@@ -685,22 +685,31 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 		if stop {
 			break
 		}
-		for ri in 0..<len(p.mem.rows) {
-			r := &p.mem.rows[ri]
-			if q.has_start && r.ts < q.start {
-				continue
-			}
-			if q.has_end && r.ts > q.end {
-				continue
-			}
-			if q.filter != nil && !exec_match(q.filter, r) {
-				continue
-			}
-			tally.matched_rows += 1
-			if exec_consume(&st, r) {
-				stop = true
+		// The memtable is striped: each shard is scanned under its own lock so a
+		// concurrent ingest batch only blocks the shard it is appending to.
+		for &sh in p.shards {
+			if stop {
 				break
 			}
+			sync.mutex_lock(&sh.mu)
+			for ri in 0..<len(sh.rows) {
+				r := &sh.rows[ri]
+				if q.has_start && r.ts < q.start {
+					continue
+				}
+				if q.has_end && r.ts > q.end {
+					continue
+				}
+				if q.filter != nil && !exec_match(q.filter, r) {
+					continue
+				}
+				tally.matched_rows += 1
+				if exec_consume(&st, r) {
+					stop = true
+					break
+				}
+			}
+			sync.mutex_unlock(&sh.mu)
 		}
 	}
 	sync.rw_mutex_shared_unlock(&s.mu)

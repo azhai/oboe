@@ -98,6 +98,66 @@ curl -sS 'http://127.0.0.1:9428/metrics' \
 和 `oboe_parts` 增加，`oboe_disk_bytes` 增加。`oboe_rows` 只统计已落盘 part，不包含
 memtable；查询会同时扫描两者。
 
+### 2.1 背压：memtable 上限与 503
+
+memtable 有**硬上限**：`-mem-max-rows`（默认 600 万行）与 `-mem-max-bytes`（默认
+1 GiB），按整库（所有分区合计）计算，任一到顶就**阻塞写入**，等后台 flush 释放空间，
+而不是继续吃内存。这两个上限都可以设 0 表示不限（仅用于压测对照，不推荐生产）。
+
+**写入可能被 503。** 阻塞不是无限的：`store_ingest` 最多等 `-mem-wait`（默认 2 s）。
+等满预算仍放不下时整批被拒，三个写入端点返回：
+
+```
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Connection: close
+Retry-After: 1
+
+{"error":"memtable full","accepted":0,"rows":100,"errors":0}
+```
+
+| 端点 | 503 body |
+| --- | --- |
+| `/insert/jsonline` | `{"error":"memtable full","accepted":0,"rows":N,"errors":M}` |
+| `/insert/elasticsearch/_bulk` | `{"took":T,"errors":true,"items":[]}` |
+| `/insert/loki/api/v1/push` | `{"error":"memtable full","retry_after":1}` |
+
+约定：
+
+- `503` 表示**这一批完全没写入**（`accepted = 0`），客户端应整批重试，不要只重发一部分；
+  建议按 `Retry-After`（1 s）退避，别立即重锤。
+- 响应带宽 `Connection: close`，连接会被关闭；用连接池的客户端需要重建连接。
+- 只有"等满预算"才会 503。预算内等到了空间就正常返回 2xx，此时请求延迟会升高
+  （最长约 `-mem-wait`），这是有意用延迟换 RSS 有界。
+
+**调优**：
+
+- 触发条件要满足"写入持续快于 flush"。短促的高峰一般等不到 2 s 就会拿到空间。
+- RSS 峰值约为上限的 **3 倍**（flush 期间的 memtable arena + 偷出的行副本 + 排序/编码
+  缓冲会同时存在）。1 GiB 上限 → 实测 3171 MB；512 MiB 上限 → 1670 MB。小内存机器从
+  `-mem-max-bytes 512MB` 起，并给 `-mem-wait` 留 1–2 s。
+- 想更早暴露压力而不是被动等满预算：把 `-mem-wait` 调小（如 `100ms`），让客户端更快
+  收到 503；不要把它设成 0，否则每次到顶都会立刻拒绝。
+
+**观察**（`/metrics`）：
+
+```bash
+curl -sS 'http://127.0.0.1:9428/metrics' | grep -E \
+ '^oboe_(mem_rows|mem_bytes|mem_limit_rows|mem_limit_bytes|ingest_stalled_seconds_total|mem_limit_rejected_total) '
+```
+
+- `oboe_mem_rows` / `oboe_mem_bytes` 贴着 `oboe_mem_limit_rows` / `oboe_mem_limit_bytes`
+  走 = 正在被限流。
+- `oboe_ingest_stalled_seconds_total` 增长 = 写入在等 flush（按线程累计，8 并发各等
+  1 s 就是 +8）。
+- `oboe_mem_limit_rejected_total` 增长 = 已经开始返回 503。持续增长说明 flush 跟不上，
+  应降低写入速率、调大 `-mem-max-*`（先确认内存）或检查磁盘吞吐。
+
+**关停**：`store_close` 先置停标志并唤醒所有等待者（等待者立即返回失败，不会睡满
+`-mem-wait`），再等后台线程收尾并做最后一次 flush。进行中的 merge 会在 block 边界
+中止（源 part 原样保留，下次启动/下个 tick 重做），因此 SIGTERM 不会被大合并拖成
+十几秒。实测 8 s 高写入压测（默认上限）SIGTERM 退出 1.94 s。
+
 ## 3. retention（按天删除）
 
 - flag：`-retention <days>`，默认 30；`0` 表示永久保留。

@@ -1,6 +1,8 @@
 package logdb
 
 import "../common"
+import "core:time"
+
 Row :: struct {
 	ts:     i64,
 	stream: u64,
@@ -11,17 +13,104 @@ Row :: struct {
 BLOCK_MAGIC :: "ODLB"
 BLOCK_VERSION :: u16(1)
 
+// Column-name lookup table and per-column value cache sizes. Both are
+// direct-mapped: a miss simply falls back to the full path, so collisions cost
+// time, never correctness.
+BLOCK_COL_SLOTS :: 32
+BLOCK_VALUE_SLOTS :: 64
+
 Enc_Col :: struct {
 	name: string,
 	vals: [dynamic]string,
+	// fnv(name) + separator, computed once per column instead of once per value.
+	base: u64,
+	// Values already indexed into this block's bloom filter. The filter keeps
+	// only the *set* of hashes (bloom_builder_finish collapses duplicates), so a
+	// repeated (column, value) can be skipped without changing one output bit.
+	keys:   [BLOCK_VALUE_SLOTS]u64,
+	cached: [BLOCK_VALUE_SLOTS]string,
+	used:   [BLOCK_VALUE_SLOTS]bool,
+}
+
+Enc_Schema :: struct {
+	cols:  [dynamic]Enc_Col,
+	slots: [BLOCK_COL_SLOTS]int, // 0 = empty, else column index + 1
+}
+
+// enc_key folds at most the last eight bytes plus the length. Field names and
+// repeated field values share a suffix far more often than a prefix, so this
+// separates them cheaply; a colliding key falls through to a string compare.
+enc_key :: #force_inline proc(s: string) -> u64 {
+	n := len(s)
+	start := 0
+	if n > 8 {
+		start = n - 8
+	}
+	h := common.fnv(common.FNV_BASIS, s[start:n])
+	return h ~ (u64(n) << 56)
+}
+
+// enc_schema_col resolves the column for `name`, appending it on first sight so
+// the serialized column order stays first-appearance order.
+enc_schema_col :: proc(sc: ^Enc_Schema, name: string, nrows: int) -> int {
+	k := enc_key(name)
+	slot := int(k) & (BLOCK_COL_SLOTS - 1)
+	for _ in 0 ..< BLOCK_COL_SLOTS {
+		v := sc.slots[slot]
+		if v == 0 {
+			idx := len(sc.cols)
+			append(&sc.cols, Enc_Col{
+				name = name,
+				vals = make([dynamic]string, nrows),
+				base = common.fnv_continue(common.fnv(common.FNV_BASIS, name), "\x00"),
+			})
+			sc.slots[slot] = idx + 1
+			return idx
+		}
+		if sc.cols[v - 1].name == name {
+			return v - 1
+		}
+		slot = (slot + 1) & (BLOCK_COL_SLOTS - 1)
+	}
+	// More distinct columns than lookup slots: fall back to a linear scan so the
+	// behaviour stays correct for very wide blocks.
+	for i in 0 ..< len(sc.cols) {
+		if sc.cols[i].name == name {
+			return i
+		}
+	}
+	idx := len(sc.cols)
+	append(&sc.cols, Enc_Col{
+		name = name,
+		vals = make([dynamic]string, nrows),
+		base = common.fnv_continue(common.fnv(common.FNV_BASIS, name), "\x00"),
+	})
+	return idx
+}
+
+// enc_bloom_value indexes `value` for column `c` unless this block already did,
+// in which case the hash set would be unchanged and the work is skipped.
+enc_bloom_value :: #force_inline proc(bb: ^Bloom_Builder, c: ^Enc_Col, value: string) {
+	k := enc_key(value)
+	slot := int(k) & (BLOCK_VALUE_SLOTS - 1)
+	if c.used[slot] && c.keys[slot] == k && c.cached[slot] == value {
+		return
+	}
+	c.used[slot] = true
+	c.keys[slot] = k
+	c.cached[slot] = value
+	bloom_builder_add_value_base(bb, c.base, value)
 }
 
 // encode_block serializes rows into a columnar block. All rows must belong to
 // the same stream. The returned timestamp bounds are also written in the header.
-encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (min_ts, max_ts: i64, ok: bool) {
+// One pass over each row fills every column slot and indexes the bloom filter:
+// a field name is resolved once (not twice) and its hash prefix reused.
+encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder, prof: ^Phase_Stats = nil) -> (min_ts, max_ts: i64, ok: bool) {
 	if len(rows) == 0 {
 		return 0, 0, false
 	}
+	t := prof_stage_start(prof != nil)
 	min_ts = rows[0].ts
 	max_ts = rows[0].ts
 	for r in rows {
@@ -32,39 +121,49 @@ encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (m
 			max_ts = r.ts
 		}
 	}
-	cols: [dynamic]Enc_Col
+	nrows := len(rows)
+	sc: Enc_Schema
 	defer {
-		for &c in cols {
+		for &c in sc.cols {
 			delete(c.vals)
 		}
-		delete(cols)
+		delete(sc.cols)
 	}
-	nrows := len(rows)
-	for ri in 0..<nrows {
+	// _msg has always been the first column, so resolve it once and write it
+	// without a lookup in the hot loop.
+	reserve(&sc.cols, 8)
+	msg_ci := enc_schema_col(&sc, "_msg", nrows)
+
+	t = prof_stage_start(prof != nil)
+	for ri in 0 ..< nrows {
 		r := &rows[ri]
-		ci := find_enc_col(&cols, "_msg", nrows)
-		cols[ci].vals[ri] = r.msg
+		c := &sc.cols[msg_ci]
+		c.vals[ri] = r.msg
+		enc_bloom_value(bloom, c, r.msg)
 		for f in r.fields {
-			ci = find_enc_col(&cols, f.name, nrows)
-			cols[ci].vals[ri] = f.value
-		}
-		bloom_builder_add_value(bloom, "_msg", r.msg)
-		for f in r.fields {
-			bloom_builder_add_value(bloom, f.name, f.value)
+			ci := enc_schema_col(&sc, f.name, nrows)
+			c = &sc.cols[ci]
+			c.vals[ri] = f.value
+			enc_bloom_value(bloom, c, f.value)
 		}
 	}
+	if prof != nil {
+		prof.collect_ns += prof_stage_end(true, t)
+	}
+
+	t = prof_stage_start(prof != nil)
 	common.buf_reset(out)
 	common.buf_string(out, BLOCK_MAGIC)
 	common.buf_u16le(out, BLOCK_VERSION)
 	common.buf_u32le(out, u32(nrows))
-	common.buf_u32le(out, u32(len(cols)))
+	common.buf_u32le(out, u32(len(sc.cols)))
 	common.buf_u64le(out, rows[0].stream)
 	common.buf_i64le(out, min_ts)
 	common.buf_i64le(out, max_ts)
 	for r in rows {
 		common.buf_i64le(out, r.ts)
 	}
-	for &c in cols {
+	for &c in sc.cols {
 		common.buf_u16le(out, u16(len(c.name)))
 		common.buf_string(out, c.name)
 		is_const := true
@@ -88,17 +187,10 @@ encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (m
 			}
 		}
 	}
-	return min_ts, max_ts, true
-}
-
-find_enc_col :: proc(cols: ^[dynamic]Enc_Col, name: string, nrows: int) -> int {
-	for i in 0..<len(cols) {
-		if cols[i].name == name {
-			return i
-		}
+	if prof != nil {
+		prof.serialize_ns += prof_stage_end(true, t)
 	}
-	append(cols, Enc_Col{name = name, vals = make([dynamic]string, nrows)})
-	return len(cols) - 1
+	return min_ts, max_ts, true
 }
 
 // ---------------------------------------------------------------- decoding

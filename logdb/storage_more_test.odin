@@ -3,6 +3,7 @@ package logdb
 import "../common"
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strings"
 import "core:testing"
 
@@ -462,4 +463,81 @@ test_store_more_part_seq_no_reuse :: proc(t: ^testing.T) {
 	testing.expect(t, found_new)
 	st := store_stats(s)
 	testing.expect_value(t, st.rows, 40)
+}
+
+// sm_merge_order_less mirrors the merge comparison: stream first, then ts.
+sm_merge_order_less :: proc(a, b: Row) -> bool {
+	if a.stream != b.stream {
+		return a.stream < b.stream
+	}
+	return a.ts < b.ts
+}
+
+// The merge no longer copies rows into an arena: the output block references the
+// decoded source blocks instead, which are pinned until the block is encoded.
+// What lands on disk must not change, so the merged part is compared byte for
+// byte against a part written directly from the same rows in merge order.
+@(test)
+test_store_more_merge_zero_copy_part_bytes_match :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("store_more_merge_bytes")
+	ref_dir := sm_tmpdir("store_more_merge_bytes_ref")
+	os.remove_all(dir)
+	os.remove_all(ref_dir)
+	defer delete(dir)
+	defer delete(ref_dir)
+	defer os.remove_all(dir)
+	defer os.remove_all(ref_dir)
+
+	cfg := sm_store_config(dir)
+	cfg.block_rows = 32
+	cfg.merge_threshold = 3
+	cfg.merge_max_rows = 10_000_000
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	base, _ := common.parse_iso_ns("2026-10-26T00:00:00Z")
+	fields := []Field{{name = "level", value = "info"}, {name = "service", value = "api"}}
+	const_batches :: 3
+	const_rows :: 40
+	expected := make([dynamic]Row, 0, const_batches * const_rows)
+	defer delete(expected)
+	for b in 0..<const_batches {
+		batch := make([]Ingest_Row, const_rows)
+		for i in 0..<const_rows {
+			n := b * const_rows + i
+			batch[i] = Ingest_Row{
+				ts = base + i64(n) * 1_000_000,
+				stream = u64(i % 3),
+				msg = "merged row",
+				fields = fields,
+			}
+			append(&expected, Row{ts = batch[i].ts, stream = batch[i].stream, msg = batch[i].msg, fields = batch[i].fields})
+		}
+		testing.expect_value(t, store_ingest(s, batch), const_rows)
+		store_flush_all(s)
+		delete(batch)
+	}
+
+	store_merge_all(s)
+	st := store_stats(s)
+	testing.expect_value(t, st.parts, 1)
+	testing.expect_value(t, st.rows, const_batches * const_rows)
+
+	slice.sort_by(expected[:], sm_merge_order_less)
+	ref, ref_ok := write_part(ref_dir, expected[:], cfg.block_rows)
+	testing.expect(t, ref_ok, "reference part write failed")
+	if !ref_ok {
+		return
+	}
+	defer close_part(ref)
+
+	merged := s.partitions[0].parts[0]
+	names := [3]string{"data.bin", "bloom.bin", "index.bin"}
+	for name in names {
+		a := fmt.aprintf("%s/%s", merged.dir, name)
+		b := fmt.aprintf("%s/%s", ref_dir, name)
+		defer delete(a)
+		defer delete(b)
+		testing.expectf(t, fp_files_equal(a, b), "merged %s differs from the reference part", name)
+	}
 }

@@ -6,6 +6,7 @@ import cachelib "../cache"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 
 HANDLERS_TEST_STREAM_FIELDS := [2]string{"level", "service"}
@@ -293,4 +294,46 @@ test_params_and_line_helpers :: proc(t: ^testing.T) {
 	testing.expect_value(t, lines[0], "a")
 	testing.expect_value(t, lines[1], "b")
 	testing.expect_value(t, lines[2], "c")
+}
+
+// Every write endpoint must turn a cap rejection into 503 + Retry-After instead
+// of either hanging or reporting success for rows it did not take.
+@(test)
+test_dispatch_ingest_overload_503 :: proc(t: ^testing.T) {
+	env := handlers_test_open(handlers_test_tmpdir("handlers_overload"))
+	defer handlers_test_close(env)
+	arena: common.Arena
+	defer common.arena_destroy(&arena)
+	// One row per store, no wait budget: the second row of any batch cannot fit.
+	env.store.cfg.mem_max_rows = 1
+	env.store.cfg.mem_wait = 0
+
+	payload := `{"_time":"2026-10-26T04:00:00Z","level":"error","service":"api","_msg":"boom"}
+{"_time":"2026-10-26T04:00:01Z","level":"info","service":"api","_msg":"ok"}
+`
+	r := handlers_test_do(env, &arena, "POST", "/insert/jsonline", "", payload)
+	testing.expect_value(t, r.code, 503)
+	testing.expect(t, strings.contains(r.body, `"error":"memtable full"`))
+	testing.expect(t, strings.contains(r.extra, "Retry-After: 1"))
+
+	es := `{"index":{}}
+{"@timestamp":"2026-10-26T05:00:00Z","message":"es a","level":"info","service":"es"}
+{"index":{}}
+{"@timestamp":"2026-10-26T05:00:01Z","message":"es b","level":"info","service":"es"}
+`
+	r = handlers_test_do(env, &arena, "POST", "/insert/elasticsearch/_bulk", "", es)
+	testing.expect_value(t, r.code, 503)
+	testing.expect(t, strings.contains(r.body, `"errors":true`))
+	testing.expect(t, strings.contains(r.extra, "Retry-After: 1"))
+
+	loki := `{"streams":[{"stream":{"level":"error","service":"loki"},"values":[["1700000000000000000","a"],["1700000000000001000","b"]]}]}`
+	r = handlers_test_do(env, &arena, "POST", "/insert/loki/api/v1/push", "", loki)
+	testing.expect_value(t, r.code, 503)
+	testing.expect(t, strings.contains(r.body, `"error":"memtable full"`))
+	testing.expect(t, strings.contains(r.extra, "Retry-After: 1"))
+
+	// The rejection path must not have taken any rows.
+	st := logdb.store_stats(env.store)
+	testing.expect_value(t, st.rows, 0)
+	testing.expect(t, sync.atomic_load(&env.store.mem_limit_rejected) >= 3)
 }

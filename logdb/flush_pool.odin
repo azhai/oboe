@@ -74,6 +74,14 @@ encode_worker :: proc(data: rawptr) {
 		delete(bb.hashes)
 		delete(bb.table)
 	}
+	// Each worker keeps its own counters and folds them into the shared
+	// profile once, so blocks encoded in parallel do not race on it.
+	active := flush_profile_enabled()
+	local: Phase_Stats
+	if active {
+		local.min_rows = ~u64(0)
+		local.min_raw = ~u64(0)
+	}
 	for {
 		i := int(sync.atomic_add(&c.cursor, 1))
 		if i >= len(c.spans) {
@@ -82,17 +90,31 @@ encode_worker :: proc(data: rawptr) {
 		sp := c.spans[i]
 		block := c.rows[sp.off:sp.off + sp.nrows]
 		bloom_builder_reset(&bb)
-		min_ts, max_ts, eok := encode_block(block, &buf, &bb)
+		prof_var: ^Phase_Stats
+		if active {
+			prof_var = &local
+		}
+		min_ts, max_ts, eok := encode_block(block, &buf, &bb, prof_var)
 		if !eok {
 			c.outs[i] = Block_Out{ok = false}
 			continue
 		}
+		t := prof_stage_start(active)
 		comp, cok := common.zlib_compress(buf.data[:], 1)
+		if active {
+			local.zlib_ns += prof_stage_end(true, t)
+		}
 		if !cok {
 			c.outs[i] = Block_Out{ok = false}
 			continue
 		}
+		t = prof_stage_start(active)
 		bits := bloom_builder_finish(&bb)
+		if active {
+			local.bloom_finish_ns += prof_stage_end(true, t)
+			local.bloom_bytes += u64(len(bits))
+			flush_profile_record_local_block(&local, sp.nrows, len(buf.data), len(comp))
+		}
 		c.outs[i] = Block_Out{
 			comp    = comp,
 			bloom   = bits,
@@ -103,6 +125,9 @@ encode_worker :: proc(data: rawptr) {
 			max_ts  = max_ts,
 			ok      = true,
 		}
+	}
+	if active {
+		flush_profile_merge_phase(.Flush, &local)
 	}
 }
 
@@ -153,10 +178,28 @@ part_writer_add_encoded :: proc(pw: ^Part_Writer, out: Block_Out) -> bool {
 		pw.ok = false
 		return false
 	}
-	if !write_all(pw.data_file, out.comp) || !write_all(pw.bloom_file, out.bloom) {
+	active := flush_profile_enabled()
+	ph: ^Phase_Stats
+	if active {
+		ph = &flush_prof.phase[int(pw.prof_scope)]
+	}
+	t := prof_stage_start(active)
+	data_ok := write_all(pw.data_file, out.comp)
+	if active {
+		ph.write_data_ns += prof_stage_end(true, t)
+		ph.data_bytes += u64(len(out.comp))
+	}
+	t = prof_stage_start(active)
+	bloom_ok := write_all(pw.bloom_file, out.bloom)
+	if active {
+		ph.write_bloom_ns += prof_stage_end(true, t)
+		ph.bloom_bytes += u64(len(out.bloom))
+	}
+	if !data_ok || !bloom_ok {
 		pw.ok = false
 		return false
 	}
+	t = prof_stage_start(active)
 	common.buf_u64le(&pw.index_buf, out.stream)
 	common.buf_i64le(&pw.index_buf, out.min_ts)
 	common.buf_i64le(&pw.index_buf, out.max_ts)
@@ -168,6 +211,9 @@ part_writer_add_encoded :: proc(pw: ^Part_Writer, out: Block_Out) -> bool {
 	common.buf_u64le(&pw.index_buf, pw.bloom_off)
 	common.buf_u32le(&pw.index_buf, u32(len(out.bloom)))
 	common.buf_u32le(&pw.index_buf, 0)
+	if active {
+		ph.index_ns += prof_stage_end(true, t)
+	}
 	pw.data_off += u64(len(out.comp))
 	pw.bloom_off += u64(len(out.bloom))
 	pw.nblocks += 1
@@ -187,7 +233,7 @@ write_part_parallel :: proc(part_dir: string, rows: []Row, block_rows, threads: 
 	if len(rows) == 0 {
 		return nil, false
 	}
-	pw := part_writer_begin(part_dir, block_rows, false)
+	pw := part_writer_begin(part_dir, block_rows)
 	if pw == nil {
 		return nil, false
 	}

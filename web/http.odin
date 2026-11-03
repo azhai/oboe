@@ -42,6 +42,10 @@ Http_Response :: struct {
 	ctype: string,
 	extra: string,
 	body:  common.Buf,
+	// close_conn forces `Connection: close` even when the client asked for
+	// keep-alive. Ingest overload uses it so a stalled request does not tie up a
+	// session that the client is about to retry on anyway.
+	close_conn: bool,
 }
 
 Http_Request :: struct {

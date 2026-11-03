@@ -103,6 +103,11 @@ odin run examples/embed  # store/cache/queue 组合示例
 | `-merge-threshold` | `8` | 分区内 part 数达到该值时合并 |
 | `-stream-fields` | `level,service` | 构成 stream 的字段，逗号分隔 |
 | `-flush-interval` | `1s` | memtable 落盘间隔 |
+| `-mem-max-rows` | `6000000` | 整库 memtable 行数硬上限；超限时写入阻塞等 flush（约 6M 行 ≈ 0.97 GiB，见下） |
+| `-mem-max-bytes` | `1GiB` | 整库 memtable 估算字节硬上限，支持 `KB/KiB/MB/MiB/GB/GiB`；`0` 表示不限 |
+| `-mem-wait` | `2s` | 单次写入最多等多久（等满仍放不下则返回错误，HTTP 侧为 503 + `Retry-After`） |
+| `-sort-threads` | `0`（自动） | 刷盘前 memtable 排序线程数；`0` = `clamp(逻辑核/2, 2, 4)`，小 memtable 自动串行 |
+| `-ingest-shards` | `0`（自动） | 每个分区 memtable 的分片数（各自一把锁、各自 arena）；`0` = 逻辑核数，钳在 4..16 |
 | `-cache-size` | `256MB` | 缓存容量，支持 `KB/KiB/MB/MiB/GB/GiB`，`0` 为不限 |
 | `-cache-max-entries` | `1000000` | 缓存 key 数量上限（近似，按桶均分），`0` 为不限 |
 | `-cache-max-value` | `16MB` | 单个 value 大小上限 |
@@ -113,6 +118,19 @@ odin run examples/embed  # store/cache/queue 组合示例
 | `-queue-max-jobs` | `1000000` | 内存中最大 job 数 |
 | `-queue-max-job-bytes` | `65535` | 单个 job body 上限 |
 | `-no-queue` | - | 关闭队列 |
+
+`-mem-max-rows` / `-mem-max-bytes` 是**硬上限**（整库 memtable 合计，不是按分区）：
+默认 600 万行 ≈ 990 MB，与 1 GiB 同量级，任一先到就阻塞写入等 flush：
+
+```
+默认行上限 6_000_000 行 × 实测约 165 B/行 ≈ 990 MB ≈ 0.97 GiB
+默认字节上限 1 GiB = 1024 MiB
+```
+
+上限约为 `flush_max_rows`（20 万行）的 30 倍，flush 跟得上时不会触发等待；触发时
+进程 RSS 峰值约为上限的 3 倍（flush 工作集与 memtable 重叠），小内存机器建议
+`-mem-max-bytes 512MB`。等满 `-mem-wait`（默认 2s）仍放不下时，HTTP 写入端点返回
+`503` + `Retry-After: 1`，细节见 `docs/cookbook/operations.md`。
 
 ## 存储架构
 

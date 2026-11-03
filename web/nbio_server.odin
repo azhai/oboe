@@ -639,13 +639,16 @@ http_job_run :: proc(srv: ^Server, job: ^Http_Job, conn: ^netio.Conn, head, body
 	sync.atomic_add(&srv.requests, 1)
 	arena: common.Arena
 	resp := dispatch(srv, &req, &arena)
-	out := http_build_response(resp.code, resp.ctype, resp.body.data[:], req.keep_alive, resp.extra)
+	// Ingest overload requests a hard close, so the client cannot queue another
+	// attempt on the same session while the memtable cap is full.
+	keep_alive := req.keep_alive && !resp.close_conn
+	out := http_build_response(resp.code, resp.ctype, resp.body.data[:], keep_alive, resp.extra)
 	common.buf_destroy(&resp.body)
 	common.arena_destroy(&arena)
 	if req.body_owned != nil {
 		delete(req.body_owned)
 	}
-	http_conn_send(job.conn, out, out.data[:], req.keep_alive, true, false)
+	http_conn_send(job.conn, out, out.data[:], keep_alive, true, false)
 }
 
 http_job_fail :: proc(c: ^Http_Conn, err: Http_Read_Error) {

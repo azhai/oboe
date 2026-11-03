@@ -56,6 +56,13 @@ ingest_worker :: proc(data: rawptr) {
 
 // fill_store writes `rows` rows concurrently and returns the wall time.
 fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> time.Duration {
+	return fill_store_range(s, rows, threads, batch, base_ts, 0, rows)
+}
+
+// fill_store_range writes rows [offset, offset+rows) of a corpus of `total`
+// rows, so a tier can be ingested in successive chunks with timestamps spread
+// over the same window.
+fill_store_range :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64, offset0, total: int) -> time.Duration {
 	corpus := corpus_make()
 	defer corpus_destroy(&corpus)
 
@@ -68,7 +75,7 @@ fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> 
 	}
 	per := rows / threads
 	rem := rows % threads
-	offset := 0
+	offset := offset0
 	for i in 0..<threads {
 		n := per
 		if i < rem {
@@ -81,7 +88,7 @@ fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> 
 			base_ts = base_ts,
 			offset = offset,
 			rows   = n,
-			total  = rows,
+			total  = total,
 			batch  = batch,
 		}
 		offset += n
@@ -99,6 +106,19 @@ store_config :: proc(dir: string) -> logdb.Store_Config {
 	return cfg
 }
 
+// apply_threads forwards the -sort-threads / -flush-threads / -ingest-shards
+// switches, which exist so the flush profile can compare serial and parallel
+// runs, plus the -mem-max-* / -mem-wait switches that turn the production
+// memtable cap back on for the backpressure probe (0 = unlimited, the default).
+apply_threads :: proc(cfg: ^logdb.Store_Config, p: Params) {
+	cfg.sort_threads = p.sort_threads
+	cfg.flush_threads = p.flush_threads
+	cfg.ingest_shards = p.ingest_shards
+	cfg.mem_max_rows = p.mem_max_rows
+	cfg.mem_max_bytes = p.mem_max_bytes
+	cfg.mem_wait = p.mem_wait
+}
+
 // open_store loads an existing directory or seeds a fresh one. Seeding is
 // skipped when reuse is set; the directory is wiped otherwise.
 open_store :: proc(p: Params, reuse: bool) -> ^logdb.Store {
@@ -107,6 +127,7 @@ open_store :: proc(p: Params, reuse: bool) -> ^logdb.Store {
 		os.remove_all(dir)
 	}
 	cfg := store_config(dir)
+	apply_threads(&cfg, p)
 	s := logdb.store_init(cfg, !reuse)
 	if !reuse {
 		base_ts := common.now_ns() - SPREAD_NS

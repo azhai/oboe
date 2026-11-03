@@ -88,15 +88,36 @@ HTTP `dispatch` 不依赖真实 socket，因此可以在测试里直接调用。
 
 ### 2.2 memtable 与 flush
 
-- `store_ingest` 在写锁内把行复制进对应 **UTC 天分区** 的 arena，时间戳 `<= 0` 时取
-  当前时间。
+- `store_ingest` 把行复制进对应 **UTC 天分区** 的 arena；分区 memtable 按 `ingest_shards`
+  分片，写入只拿目标分片的锁、只在该分片的 arena 里分配，时间戳 `<= 0` 时取当前时间。
 - 后台线程每 250 ms 检查一次 flush 条件：行数达到 `flush_max_rows`（20 万）、估算
   字节数达到 `flush_max_bytes`（128 MiB），或最旧一行等待超过 `flush_interval`
-  （默认 1 s）。
+  （默认 1 s）；此外**整库 memtable 用量达到上限的一半**时也会提前落盘（见 2.3）。
 - flush 时先在锁内把 memtable 换成新的空表，再在锁外按 `(stream, ts)` 排序并写入新
   part。写入失败会把行重新放回 memtable。
 - part 目录名为 `p_<16 位十六进制序号>`，序号由原子计数器分配；启动时从已有目录名
   恢复最大序号，避免重启后覆盖。
+
+### 2.3 memtable 上限与背压
+
+memtable 只受 flush 阈值约束时，写入持续快于 flush 就会无界堆积（实测可到 2314 万行、
+RSS 3.8 GiB，关停要 33 s）。为此加了一条**准入控制**：
+
+- **整库硬上限**：`mem_max_rows`（默认 600 万）与 `mem_max_bytes`（默认 1 GiB），按所有
+  分区的 memtable 合计计算；两个原子计数 `mem_rows` / `mem_bytes` 在追加前预扣、在
+  flush 偷走 memtable（以及 retention 删分区）时归还。预扣和上限检查在同一把
+  `space_mu` 里完成，避免并发批次各自超卖。
+- **有界等待**：放不下时写入在 `space_cond` 上等，最多 `mem_wait`（默认 2 s）；等满预算
+  仍放不下就整批拒绝，调用方拿到 `rejected`（HTTP 侧转成 503 + `Retry-After`）。
+- **锁依赖单向**：`reserve_mem` 在拿 `s.mu` **之前**完成，等待期间只持 `space_mu`；
+  flush 的顺序是 `mu -> space_mu`。所以 ingest 可能等 flush，flush 永远不会等 ingest，
+  不存在环。
+- **关停**：`store_close` 先置 `stop` 再 `cond_broadcast`，等待者立即返回失败而不是睡满
+  预算；进行中的 merge 在每个 block 边界检查 `stop` 并中止（源 part 原样保留，下次
+  重做），避免一次大合并把 SIGTERM 拖成十几秒。
+- **代价值得注意**：RSS 峰值约为上限的 3 倍（flush 工作集与 memtable 重叠），所以
+  1 GiB 上限对应约 3.1 GB 峰值 RSS；512 MiB 对应约 1.7 GB。默认值给的是"能扛住
+  突发、又不至于把机器打爆"的量级。
 
 ## 3. 磁盘格式
 
