@@ -431,4 +431,39 @@ counter 单调；185 秒共服务 1666 万次 HTTP 请求和 25.8 万次查询�
 3. `OUT=/tmp/oboe_matrix bench/run_matrix.sh`（完整）或加 `--quick`（冒烟）。
 4. `$OUT/results/summary.md` 即本节表格；`raw.jsonl` 可自行重算；
    `shutdown.log` 记录被 SIGKILL 的收尾。
-5. `odin test tests -all-packages` 应为 87 个测试全部通过。
+5. `odin test tests -all-packages` 应为 93 个测试全部通过。
+
+## 写入刷盘并行化（P1–P6）
+
+针对「结论 2」的写路径瓶颈，按「先测量、再拆阶段」的顺序做了六轮改造，每轮独立提交
+并在 `bench-suite` 分支留档；分阶段计时由 `bench -mode flush-profile` 采集。
+
+| 阶段 | 改动 | 效果（10 核 / 16 GiB） |
+|---|---|---|
+| P1 | 块级并行编码+压缩（`logdb/flush_pool.odin`）、`-flush-threads` | 1M 行 write 477 → 130.6 ms（3.65×）；200k 行 93 → 21.9 ms（4.25×，9.15M rows/s） |
+| P2 | memtable 分块并行排序 + k 路归并 | 1M 行 sort 444.9 → 81.6 ms（5.45×）；200k 行 64.8 → 13.8 ms |
+| P4 | 有界刷盘（5 ms 轮询、按 `flush_max_rows` 分块出 part、摄入背压） | 盘上 part 恒为 200,000 行，积压不再逐轮放大 |
+| P5 | merge 复用并行编码（32 block 窗口）+ flush 优先 | merge 不再整段占用刷盘线程 |
+| P3 | 摄入按天批量查分区 + reserve | 吞吐持平，p99 略降 |
+| P6 | part 引用计数，查询扫描移出共享锁 | 全量 `count()` 扫描下写入 0.99M → 2.48M rows/s |
+
+`flush-profile`（1M 行、5 线程）：sort-serial 444.9 / **sort 81.6** / encode 248.0
+（其中 bloom 181.1）/ compress 152.4 / write 96.9 ms。排序已从首要瓶颈变成最便宜的一段。
+
+端到端（8 workers、8 连接、100 行/请求、5 s × 3 轮）：
+
+| 配置 | 第 1/2/3 轮 rows/s | 退出耗时 |
+|---|---|---|
+| 优化前 | 4.07M → 0.95M → 0.90M | >20 s（被 SIGKILL） |
+| `-flush-threads 1` | 0.96M → 0.96M → 0.96M | 1 s |
+| `-flush-threads 5` | 2.78M → 2.81M → 2.78M | 1 s |
+
+补充说明：
+
+- 轮次间衰减消失，SIGTERM 收尾从 20+ 秒降到 1 秒；5 秒内
+  `oboe_flush_rows_total` 与 `oboe_ingested_rows_total` 完全一致（17,251,200 行）。
+- 持续吞吐仍由单个刷盘线程封顶（8 写连接下约 2.8M rows/s）；摄入速率超过刷盘速率时，
+  背压把 memtable 稳定在 4×`flush_max_rows` 以内，而不是无界增长。
+- P6 的取舍：重查询（全量 `count()`）与刷盘线程争 CPU，p50 362→566 ms、p99 728→1270 ms，
+  换来写入吞吐 2.5× 提升；轻量查询 p99 5.08→4.65 ms。
+- `/metrics` 新增 `oboe_flush_rows_total`、`oboe_flush_ms_last`，可直接观察单次刷盘规模。
