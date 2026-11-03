@@ -233,22 +233,40 @@ record :: proc(w: ^Worker, code: int, ok: bool, dt_ms: f64, resp_bytes: i64, bas
 	}
 }
 
+// Open (or re-open) the session's socket. Keeping this separate lets the
+// keep-alive loop recover from a server-side close instead of parking the
+// worker: with the memtable cap a write can come back as `503 Connection:
+// close`, and every real client redials after that.
+keep_alive_open :: proc(w: ^Worker, rr: ^Reader) -> bool {
+	sock, derr := net.dial_tcp(w.ep)
+	if derr != nil {
+		w.dial_err += 1
+		return false
+	}
+	_ = net.set_option(sock, .Receive_Timeout, w.args.timeout)
+	_ = net.set_option(sock, .TCP_Nodelay, true)
+	rr.sock = sock
+	rr.start = 0
+	rr.end = 0
+	return true
+}
+
 keep_alive_user :: proc(w: ^Worker) {
 	base := time.tick_now()
 	warm := w.args.warm
 	window := warm + w.args.dur
 
-	sock, derr := net.dial_tcp(w.ep)
-	if derr != nil {
-		w.dial_err = 1
-		return
-	}
-	defer net.close(sock)
-	_ = net.set_option(sock, .Receive_Timeout, w.args.timeout)
-	_ = net.set_option(sock, .TCP_Nodelay, true)
 	rr := new(Reader)
 	defer free(rr)
-	rr.sock = sock
+	if !keep_alive_open(w, rr) {
+		return
+	}
+	opened := true
+	defer {
+		if opened {
+			net.close(rr.sock)
+		}
+	}
 
 	measured := 0
 	for {
@@ -267,17 +285,22 @@ keep_alive_user :: proc(w: ^Worker) {
 			delete(req)
 		}
 		dt := tick_ms(t0)
-		if measure {
-			if ok {
-				measured += 1
-				record(w, code, w.args.expect == 0 || code == w.args.expect, dt, rbytes, base)
-			} else {
-				w.transport += 1
-				break
-			}
+		if measure && ok {
+			measured += 1
+			record(w, code, w.args.expect == 0 || code == w.args.expect, dt, rbytes, base)
 		}
 		if !ok {
-			break
+			// The session died (503 overload closes it, or the server is
+			// shutting down). Redial and keep measuring; a run that ends here
+			// would report zero throughput instead of a throttled one.
+			w.transport += 1
+			net.close(rr.sock)
+			opened = false
+			time.sleep(time.Millisecond)
+			if !keep_alive_open(w, rr) {
+				break
+			}
+			opened = true
 		}
 	}
 }
