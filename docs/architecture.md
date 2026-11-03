@@ -313,8 +313,15 @@ timestamps: nrows * i64
 ## 8. HTTP 并发模型
 
 - 连接与计算解耦。`server_run` 所在线程独占一个 `core:nbio` 事件循环，负责
-  accept、接收字节、判断请求是否完整并写回响应；同时在线连接数只受 fd/内存
-  限制，不再受 `-workers` 限制。
+  accept、接收字节、判断请求是否完整并写回响应；同时在线连接数不再受
+  `-workers` 限制，改由 `-max-conns`（默认 4096）与 fd/内存约束。
+- 连接上限在循环线程判定（`on_accept` 里比较 `len(srv.live)`），发生在创建
+  `Http_Conn` 和投递业务任务之前。越限的 socket 立即收到 `503 Service Unavailable`
+  （`Connection: close`、`Retry-After: 1`、`{"error":"too many connections"}`），
+  发完即关闭；它不会进入 `live`，因此既不计入活跃连接 gauge，也不占用业务线程。
+  运维从 `oboe_http_conns_rejected_total` 能直接区分「被限流」与「服务故障」。
+- 可选连接上限的内存估算：每连接固定 16 KiB 接收缓冲，默认 `4096 × 16 KiB ≈ 64 MiB`，
+  尚未计入按需增长的 `raw`（当前请求字节）；请求体上限 256 MiB 只约束单个请求。
 - 事件循环只做 I/O，不做业务：请求（head + body）完整到达后才进入
   `-workers` 个业务线程（默认 8）。业务线程在 `netio.Conn.src` 预填充缓冲上
   复用原有 HTTP 解析路径，执行同步的 `logdb.execute`，再把响应字节交回循环
@@ -327,12 +334,18 @@ timestamps: nrows * i64
 - 支持 `Content-Length`、chunked、`Expect: 100-continue`、请求体 gzip 解压。
   `100-continue` 由循环在 head 解析后、读取 body 前发出；请求头 64 KiB、
   请求体 256 MiB 的上限同样在循环侧判定，超限请求不会进入业务线程。
+- chunked 帧只有一份实现：`netio/chunked.odin` 的 `chunk_frame`（纯函数 +
+  `Chunk_Framer` 增量状态）。循环用它判断「是否完整 / 需要更多 / 格式非法 / 超限」，
+  业务线程用同一个函数解码 payload，解析器不再自行推导 chunk 边界。因此同一输入
+  在两条路径上必然得到同一分类：`Bad_Format`（非法 size、chunk 后 CRLF 损坏、
+  帧行超长）→ `400`，`Too_Large`（累计解码量超过 `max_body`，在消费 payload
+  前按声明 size 判定）→ `413`。
 - 上限：请求头 64 KiB、请求体 256 MiB、空闲读超时 60 s、发送超时 30 s；
   开启 `TCP_NODELAY`。响应带宽松 CORS 头和 `Server: oboe`。
 - 上限错误不静默断连：请求头超限回 `431`，`Content-Length` 声明或 chunked 累计
   body 超限回 `413`，`Content-Length` 与 `Transfer-Encoding` 并存、非法 chunk
-  size/框架回 `400`；响应带 `Content-Length` 与 `Connection: close`，发送后关闭，
-  不再读取剩余 body。
+  size/框架回 `400`，连接数超 `-max-conns` 回 `503`；响应带 `Content-Length` 与
+  `Connection: close`，发送后关闭，不再读取剩余 body。
 - 关停：`server_request_stop` 仍然只原子置位 + close 监听 fd（异步信号安全）。
   循环每 50 ms 检查停止标志，停止 accept、shutdown 所有连接以唤醒阻塞 I/O、
   等待在途业务任务交回（上限 5 s），再关闭全部连接并释放 loop。

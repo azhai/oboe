@@ -70,6 +70,7 @@ Flags (logs):
   -data <dir>             data directory (default "./data")
   -listen <host:port>     HTTP listen address (default "0.0.0.0:9428")
   -workers <n>            HTTP worker threads (default 8)
+  -max-conns <n>          max simultaneous HTTP connections (default 4096, 0 = unlimited)
   -retention <days>       delete partitions older than N days (default 30, 0 = keep forever)
   -block-rows <n>         rows per storage block (default 8192)
   -merge-threshold <n>    merge a partition once it has N parts (default 8)
@@ -183,6 +184,12 @@ main :: proc() {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v, 10); nok && n > 0 {
 					server_cfg.workers = n
+				}
+			}
+		case "-max-conns", "--max-conns":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v, 10); nok && n >= 0 {
+					server_cfg.max_conns = n
 				}
 			}
 		case "-retention", "--retention":

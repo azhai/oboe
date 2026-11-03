@@ -727,6 +727,12 @@ handle_metrics :: proc(srv: ^Server, out: ^common.Buf) {
 	common.buf_addf(out, "oboe_disk_bytes %d\n", st.disk_bytes)
 	common.buf_addf(out, "oboe_http_requests_total %d\n", srv.requests)
 	common.buf_addf(out, "oboe_http_connections_total %d\n", srv.conns)
+	common.buf_addf(out, "# HELP oboe_http_connections Open HTTP connections.\n")
+	common.buf_addf(out, "# TYPE oboe_http_connections gauge\n")
+	common.buf_addf(out, "oboe_http_connections %d\n", sync.atomic_load(&srv.active))
+	common.buf_addf(out, "# HELP oboe_http_conns_rejected_total Connections answered with 503 by -max-conns.\n")
+	common.buf_addf(out, "# TYPE oboe_http_conns_rejected_total counter\n")
+	common.buf_addf(out, "oboe_http_conns_rejected_total %d\n", sync.atomic_load(&srv.conns_rejected))
 	if srv.cache != nil {
 		cs := cachelib.cache_stats(srv.cache)
 		common.buf_addf(out, "oboe_cache_entries %d\n", cs.entries)

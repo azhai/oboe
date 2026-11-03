@@ -17,6 +17,10 @@ import "core:time"
 
 HTTP_MAX_HEADER :: 64 << 10
 HTTP_MAX_BODY :: 256 << 20
+// DEFAULT_MAX_CONNS bounds the connections the event loop keeps open at once.
+// Each live connection owns a 16 KiB receive buffer plus its request bytes, so
+// 4096 × 16 KiB ≈ 64 MiB of receive buffers before any body is buffered.
+DEFAULT_MAX_CONNS :: 4096
 HTTP_IDLE_TIMEOUT :: 60 * time.Second
 
 // Http_Read_Error tells the caller why a request could not be read. Only the
@@ -83,69 +87,45 @@ next_crlf :: proc(s: string, pos: ^int) -> (string, bool) {
 	return "", false
 }
 
-read_chunked_body :: proc(c: ^netio.Conn, body: ^common.Buf, max_body: int) -> Http_Read_Error {
-	line := common.buf_init(64)
-	defer common.buf_destroy(&line)
-	for {
-		if !netio.conn_read_line(c, &line, HTTP_MAX_HEADER) {
-			// conn_read_line only leaves an oversized buffer behind when it
-			// rejects a line for length; otherwise the peer went away.
-			if len(line.data) > HTTP_MAX_HEADER {
-				return .Bad_Request
-			}
-			return .Drop
-		}
-		size_str := string(line.data[:])
-		// strip chunk extensions
-		if semi := strings.index_byte(size_str, ';'); semi >= 0 {
-			size_str = size_str[:semi]
-		}
-		size_str = strings.trim_space(size_str)
-		if len(size_str) == 0 {
-			return .Bad_Request
-		}
-		size, ok := strconv.parse_int(size_str, 16)
-		if !ok || size < 0 {
-			return .Bad_Request
-		}
-		if size == 0 {
-			// trailers
-			for {
-				if !netio.conn_read_line(c, &line, HTTP_MAX_HEADER) {
-					if len(line.data) > HTTP_MAX_HEADER {
-						return .Bad_Request
-					}
-					return .Drop
-				}
-				if len(line.data) == 0 {
-					return .None
-				}
-			}
-		}
-		// The declared chunk size already decides whether the body can fit, so
-		// answer 413 before consuming any of it.
-		if size > max_body - len(body.data) {
+// read_chunked_body frames and decodes the chunked body with netio.chunk_frame,
+// the same state machine the event loop uses to decide completeness. `src` is
+// the body slice (starting right after the head) when the caller already has
+// all bytes; nil falls back to reading bytes off the connection.
+read_chunked_body :: proc(c: ^netio.Conn, body: ^common.Buf, max_body: int, src: []u8) -> Http_Read_Error {
+	fr: netio.Chunk_Framer
+	if src != nil {
+		switch netio.chunk_frame(&fr, src, max_body, HTTP_MAX_HEADER, body) {
+		case .Complete:
+			return .None
+		case .Too_Large:
 			return .Body_Too_Large
-		}
-		if !netio.conn_read_exact(c, size, body) {
-			return .Drop
-		}
-		// trailing CRLF
-		cr, cok1 := netio.conn_read_byte(c)
-		if !cok1 {
-			return .Drop
-		}
-		lf, cok2 := netio.conn_read_byte(c)
-		if !cok2 {
-			return .Drop
-		}
-		if cr != '\r' || lf != '\n' {
+		case .Bad_Format:
 			return .Bad_Request
+		case .Need_More:
+			return .Drop
+		}
+	}
+	scratch := common.buf_init(4096)
+	defer common.buf_destroy(&scratch)
+	for {
+		switch netio.chunk_frame(&fr, scratch.data[:], max_body, HTTP_MAX_HEADER, body) {
+		case .Complete:
+			return .None
+		case .Too_Large:
+			return .Body_Too_Large
+		case .Bad_Format:
+			return .Bad_Request
+		case .Need_More:
+			b, ok := netio.conn_read_byte(c)
+			if !ok {
+				return .Drop
+			}
+			common.buf_byte(&scratch, b)
 		}
 	}
 }
 
-http_read_request :: proc(c: ^netio.Conn, head, body: ^common.Buf, max_body: int) -> (req: Http_Request, err: Http_Read_Error) {
+http_read_request :: proc(c: ^netio.Conn, head, body: ^common.Buf, max_body: int, raw: []u8 = nil) -> (req: Http_Request, err: Http_Read_Error) {
 	common.buf_reset(body)
 	err = http_read_head(c, head)
 	if err != .None {
@@ -237,7 +217,13 @@ http_read_request :: proc(c: ^netio.Conn, head, body: ^common.Buf, max_body: int
 		http_send_raw(c.sock, transmute([]u8)string("HTTP/1.1 100 Continue\r\n\r\n"))
 	}
 	if req.chunked {
-		cerr := read_chunked_body(c, body, max_body)
+		// head.data holds exactly the head (including the final CRLFCRLF), so
+		// its length is where the body starts inside `raw`.
+		body_src: []u8
+		if raw != nil && len(raw) >= len(head.data) {
+			body_src = raw[len(head.data):]
+		}
+		cerr := read_chunked_body(c, body, max_body, body_src)
 		if cerr != .None {
 			return req, cerr
 		}
@@ -366,6 +352,8 @@ http_send_read_error :: proc(sock: net.TCP_Socket, err: Http_Read_Error) -> bool
 Server_Config :: struct {
 	listen:        string,
 	workers:       int,
+	// max_conns caps simultaneously open connections. 0 means unlimited.
+	max_conns:     int,
 	max_body:      int,
 	stream_fields: []string,
 }
@@ -374,6 +362,7 @@ default_server_config :: proc() -> Server_Config {
 	return Server_Config{
 		listen  = "0.0.0.0:9428",
 		workers = 8,
+		max_conns = DEFAULT_MAX_CONNS,
 		max_body = HTTP_MAX_BODY,
 	}
 }
@@ -407,6 +396,13 @@ Server :: struct {
 	requests:   u64,
 	errors:     u64,
 	conns:      u64,
+	// active is the gauge of open connections owned by the event loop; rejected
+	// connections are never counted. conns_rejected grows by one per 503.
+	active:         u32,
+	conns_rejected: u64,
+	// rejects counts 503 replies still in flight; shutdown ticks until they are
+	// closed so no send/close operation outlives the loop.
+	rejects: u32,
 }
 
 server_init :: proc(cfg: Server_Config, store: ^logdb.Store, cache: ^cachelib.Cache = nil, queue: ^queuelib.Queue = nil) -> ^Server {

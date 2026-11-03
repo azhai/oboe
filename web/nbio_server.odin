@@ -35,13 +35,6 @@ Frame_Mode :: enum {
 	Complete,
 }
 
-Chunk_State :: enum {
-	Size,
-	Data,
-	Crlf,
-	Trailer,
-}
-
 Http_Scan :: enum {
 	Need_More,
 	Complete,
@@ -67,12 +60,13 @@ Http_Conn :: struct {
 	head_scan: int,
 	head_end:  int,
 
-	frame:        Frame_Mode,
-	content_len:  int,
-	chunk_state:  Chunk_State,
-	chunk_pos:    int,
-	chunk_need:   int,
-	chunk_total:  int,
+	frame:       Frame_Mode,
+	content_len: int,
+	// framer is the shared chunked state machine from netio. Its positions are
+	// relative to raw.data[head_end:], and the parser in the worker runs the
+	// same function over the same bytes, so both halves classify an input
+	// identically.
+	framer: netio.Chunk_Framer,
 
 	expect_continue: bool,
 	continue_sent:   bool,
@@ -162,7 +156,7 @@ server_loop_shutdown :: proc(srv: ^Server) {
 		_ = nbio.tick(10 * time.Millisecond)
 	}
 	// Give the send/close callbacks one more turn before tearing down.
-	for len(srv.live) > 0 && time.tick_since(drain_start) < HTTP_DRAIN_TIMEOUT {
+	for (len(srv.live) > 0 || srv.rejects > 0) && time.tick_since(drain_start) < HTTP_DRAIN_TIMEOUT {
 		for c in srv.live {
 			http_conn_close(c)
 		}
@@ -182,13 +176,64 @@ on_accept :: proc(op: ^nbio.Operation, srv: ^Server) {
 	}
 	srv.accept_op = nbio.accept_poly(srv.listener, srv, on_accept, l = srv.loop)
 
+	client := op.accept.client
+	// The limit is enforced here, on the loop thread, before a connection
+	// object or a business job exists. A rejected connection never becomes
+	// "live", so it cannot be counted as active and cannot displace a job.
+	if srv.cfg.max_conns > 0 && len(srv.live) >= srv.cfg.max_conns {
+		sync.atomic_add(&srv.conns_rejected, 1)
+		http_conn_reject(srv, client)
+		return
+	}
+
 	c := new(Http_Conn)
 	c.srv = srv
 	c.loop = srv.loop
-	c.sock = op.accept.client
+	c.sock = client
 	c.raw = common.buf_init(4096)
 	append(&srv.live, c)
+	sync.atomic_add(&srv.active, 1)
 	http_conn_start(c)
+}
+
+// Http_Reject owns a 503 reply until it is written and the socket is closed.
+Http_Reject :: struct {
+	srv:      ^Server,
+	loop:     ^nbio.Event_Loop,
+	sock:     net.TCP_Socket,
+	owned:    common.Buf,
+	send_op:  ^nbio.Operation,
+	close_op: ^nbio.Operation,
+}
+
+// http_conn_reject answers a connection that exceeded -max-conns with an
+// explicit 503 and closes it, so operators see throttling instead of a hang.
+http_conn_reject :: proc(srv: ^Server, sock: net.TCP_Socket) {
+	r := new(Http_Reject)
+	r.srv = srv
+	r.loop = srv.loop
+	r.sock = sock
+	srv.rejects += 1
+	r.owned = http_build_response(
+		503,
+		"application/json",
+		transmute([]u8)string(`{"error":"too many connections"}`),
+		false,
+		"Retry-After: 1\r\n",
+	)
+	r.send_op = nbio.send_poly(sock, [][]byte{r.owned.data[:]}, r, on_reject_sent, all = true, timeout = HTTP_SEND_TIMEOUT, l = srv.loop)
+}
+
+on_reject_sent :: proc(_: ^nbio.Operation, r: ^Http_Reject) {
+	r.send_op = nil
+	r.close_op = nbio.close_poly(r.sock, r, on_reject_closed, l = r.loop)
+}
+
+on_reject_closed :: proc(_: ^nbio.Operation, r: ^Http_Reject) {
+	r.close_op = nil
+	r.srv.rejects -= 1
+	common.buf_destroy(&r.owned)
+	free(r)
 }
 
 on_accept_retry :: proc(_: ^nbio.Operation, srv: ^Server) {
@@ -231,10 +276,7 @@ http_conn_resume :: proc(c: ^Http_Conn) {
 	c.head_end = 0
 	c.frame = .Head
 	c.content_len = 0
-	c.chunk_state = .Size
-	c.chunk_pos = 0
-	c.chunk_need = 0
-	c.chunk_total = 0
+	c.framer = {}
 	c.expect_continue = false
 	c.continue_sent = false
 	http_conn_start(c)
@@ -359,6 +401,7 @@ on_conn_closed :: proc(_: ^nbio.Operation, c: ^Http_Conn) {
 		}
 	}
 	common.buf_destroy(&c.raw)
+	sync.atomic_sub(&c.srv.active, 1)
 	sync.atomic_add(&c.srv.conns, 1)
 	free(c)
 }
@@ -459,8 +502,7 @@ http_scan_framing :: proc(c: ^Http_Conn) -> Frame_Scan {
 	}
 	if te_present && chunked {
 		c.frame = .Chunked
-		c.chunk_state = .Size
-		c.chunk_pos = c.head_end
+		c.framer = {}
 	} else if cl_present {
 		c.frame = .Content_Length
 		c.content_len = cl
@@ -494,86 +536,24 @@ http_scan_body :: proc(c: ^Http_Conn) -> Http_Scan {
 	return .Need_More
 }
 
-// http_scan_chunks mirrors read_chunked_body incrementally so the whole body
-// never has to be buffered twice before the parser sees it.
+// http_scan_chunks defers every chunked decision to netio.chunk_frame, the same
+// function the request parser decodes with. The loop only needs the end offset;
+// no second copy of the state machine lives here.
 http_scan_chunks :: proc(c: ^Http_Conn) -> Http_Scan {
-	raw := c.raw.data[:]
-	limit := c.srv.cfg.max_body
-	for {
-		switch c.chunk_state {
-		case .Size:
-			rel := c.chunk_pos
-			idx := strings.index(string(raw[rel:]), "\r\n")
-			if idx < 0 {
-				if len(raw) - rel > HTTP_MAX_HEADER {
-					http_conn_fail(c, .Bad_Request)
-					return .Failed
-				}
-				return .Need_More
-			}
-			size_str := string(raw[rel:rel + idx])
-			if semi := strings.index_byte(size_str, ';'); semi >= 0 {
-				size_str = size_str[:semi]
-			}
-			size_str = strings.trim_space(size_str)
-			line_len := idx + 2
-			c.chunk_pos = rel + line_len
-			if len(size_str) == 0 {
-				http_conn_fail(c, .Bad_Request)
-				return .Failed
-			}
-			size, ok := strconv.parse_int(size_str, 16)
-			if !ok || size < 0 {
-				http_conn_fail(c, .Bad_Request)
-				return .Failed
-			}
-			if size == 0 {
-				// Last chunk; consume trailers up to the empty line.
-				c.chunk_state = .Trailer
-			} else {
-				if size > limit - c.chunk_total {
-					http_conn_fail(c, .Body_Too_Large)
-					return .Failed
-				}
-				c.chunk_need = size
-				c.chunk_state = .Data
-			}
-		case .Data:
-			if len(raw) - c.chunk_pos < c.chunk_need {
-				return .Need_More
-			}
-			c.chunk_pos += c.chunk_need
-			c.chunk_total += c.chunk_need
-			c.chunk_need = 0
-			c.chunk_state = .Crlf
-		case .Crlf:
-			if len(raw) - c.chunk_pos < 2 {
-				return .Need_More
-			}
-			if raw[c.chunk_pos] != '\r' || raw[c.chunk_pos + 1] != '\n' {
-				http_conn_fail(c, .Bad_Request)
-				return .Failed
-			}
-			c.chunk_pos += 2
-			c.chunk_state = .Size
-		case .Trailer:
-			rel := c.chunk_pos
-			idx := strings.index(string(raw[rel:]), "\r\n")
-			if idx < 0 {
-				if len(raw) - rel > HTTP_MAX_HEADER {
-					http_conn_fail(c, .Bad_Request)
-					return .Failed
-				}
-				return .Need_More
-			}
-			c.chunk_pos = rel + idx + 2
-			if idx == 0 {
-				c.frame = .Complete
-				c.req_end = c.chunk_pos
-				return .Complete
-			}
-		}
+	switch netio.chunk_frame(&c.framer, c.raw.data[c.head_end:], c.srv.cfg.max_body, HTTP_MAX_HEADER, nil) {
+	case .Complete:
+		c.req_end = c.head_end + c.framer.end
+		return .Complete
+	case .Too_Large:
+		http_conn_fail(c, .Body_Too_Large)
+		return .Failed
+	case .Bad_Format:
+		http_conn_fail(c, .Bad_Request)
+		return .Failed
+	case .Need_More:
+		return .Need_More
 	}
+	return .Need_More
 }
 
 http_conn_fail :: proc(c: ^Http_Conn, err: Http_Read_Error) {
@@ -648,7 +628,7 @@ http_job_run :: proc(srv: ^Server, job: ^Http_Job, conn: ^netio.Conn, head, body
 	common.buf_reset(head)
 	common.buf_reset(body)
 
-	req, rerr := http_read_request(conn, head, body, srv.cfg.max_body)
+	req, rerr := http_read_request(conn, head, body, srv.cfg.max_body, job.conn.raw.data[:])
 	if rerr != .None {
 		if req.body_owned != nil {
 			delete(req.body_owned)

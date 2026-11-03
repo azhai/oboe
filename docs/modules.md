@@ -86,7 +86,14 @@ common  +  netio  +  logdb  +  cache  +  queue  ←  web  ←  cmd
 ### `netio`
 
 `Conn`、`conn_fill`、`conn_read_byte`、`conn_read_exact`、`conn_read_line`、
-`parse_listen`。
+`parse_listen`，以及 `netio/chunked.odin` 里的 `chunk_frame` / `Chunk_Framer`。
+
+`chunk_frame` 是 HTTP/1.1 chunked 帧的唯一实现：它把「从请求头结束处的缓冲区 +
+累计已解码量 + `max_body` + 单行上限」推进成 `Complete`（含 body 结束偏移）、
+`Need_More`、`Bad_Format`、`Too_Large` 四种结果，可选地把 payload 追加到输出缓冲。
+放在 `netio` 而不是 `web`，是因为事件循环（`web/nbio_server.odin`）与请求解析器
+（`web/http.odin`）都必须调用它，而 `netio` 不依赖 HTTP 层，两边都能导入；如果把
+它留在 `web`，循环侧和解析侧仍会各写一份状态机，这正是要消除的重复。
 
 `Conn` 有两种字节来源：默认从 `sock` 阻塞读取；当 `Conn.src` 非空时改为从
 预填充切片读取。HTTP 事件循环把完整请求交给业务线程后，业务线程用后者复用同
@@ -97,9 +104,10 @@ common  +  netio  +  logdb  +  cache  +  queue  ←  web  ←  cmd
 
 `web/http.odin` 只做协议：状态机、上限判定、响应构造。`web/nbio_server.odin`
 拥有 `core:nbio` 事件循环与连接缓冲，负责 accept、请求完整性判定、把完整请求
-投递给业务线程、异步写回以及关停时序。`-workers` 只决定业务线程数量，不限制
-连接数。两者的边界是 `Http_Conn.raw`（循环侧请求字节）和响应缓冲区（业务侧
-分配、发送回调释放）。
+投递给业务线程、异步写回以及关停时序。`-workers` 只决定业务线程数量；连接数上限
+是独立参数 `-max-conns`，越限连接在循环线程内直接回 `503` 并关闭，不进入
+`Http_Conn` / 任务队列，也不计入活跃连接统计。两者的边界是 `Http_Conn.raw`
+（循环侧请求字节）和响应缓冲区（业务侧分配、发送回调释放）。
 
 ### `logdb`
 
