@@ -1,5 +1,6 @@
 package logdb
 
+import "../common"
 import "core:fmt"
 import "core:os"
 import "core:slice"
@@ -115,4 +116,105 @@ test_parallel_part_matches_serial :: proc(t: ^testing.T) {
 		delete(a)
 		delete(b)
 	}
+}
+
+// Parallel sorting must produce the same permutation as the serial sort: keys
+// here are unique, so any difference in order is a real bug in the chunk/merge
+// boundaries rather than an artifact of an unstable sort.
+@(test)
+test_parallel_sort_matches_serial :: proc(t: ^testing.T) {
+	const_rows :: 20_003
+	rows := make([]Row, const_rows)
+	defer delete(rows)
+	serial := make([]Row, const_rows)
+	defer delete(serial)
+	for i in 0 ..< const_rows {
+		// ts is unique, so every (stream, ts) key is unique too.
+		rows[i] = Row{ts = i64(i) * 3, stream = u64((i * 7) % 13 + 1)}
+	}
+	copy(serial, rows)
+	slice.sort_by(serial, row_less)
+
+	sort_rows(rows, 8)
+
+	for i in 0 ..< len(rows) {
+		// Keys are unique, so a matching stream/ts pair at every index proves
+		// the parallel sort produced exactly the serial permutation.
+		if rows[i].ts != serial[i].ts || rows[i].stream != serial[i].stream {
+			testing.expectf(t, false, "parallel sort differs from serial sort at row %d", i)
+			return
+		}
+	}
+}
+
+// A merge larger than MERGE_WINDOW_BLOCKS goes through several encode windows;
+// the resulting part must still hold every row ordered by (stream, ts).
+@(test)
+test_merge_windows_cover_all_rows :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("merge_windows")
+	defer delete(dir)
+	os.remove_all(dir)
+	defer os.remove_all(dir)
+
+	cfg := sm_store_config(dir)
+	cfg.block_rows = 8
+	cfg.merge_threshold = 3
+	cfg.merge_max_rows = 100_000_000
+	s := store_init(cfg, false)
+	defer store_close(s)
+
+	base, _ := common.parse_iso_ns("2026-10-26T00:00:00Z")
+	fields := []Field{{name = "level", value = "info"}}
+	const_batches :: 4
+	const_rows :: 300
+	// MERGE_WINDOW_BLOCKS * block_rows is 256 rows, so this merge spans five
+	// windows and exercises the window hand-off.
+	for b in 0 ..< const_batches {
+		batch := make([]Ingest_Row, const_rows)
+		for i in 0 ..< const_rows {
+			n := b * const_rows + i
+			batch[i] = Ingest_Row{
+				ts     = base + i64(n) * 1_000_000,
+				stream = u64(i % 3),
+				msg    = "window row",
+				fields = fields,
+			}
+		}
+		testing.expect_value(t, store_ingest(s, batch), const_rows)
+		store_flush_all(s)
+		delete(batch)
+	}
+
+	store_merge_all(s)
+	st := store_stats(s)
+	testing.expect_value(t, st.parts, 1)
+	testing.expect_value(t, st.rows, const_batches * const_rows)
+
+	merged := s.partitions[0].parts[0]
+	testing.expect_value(t, merged.meta.rows, const_batches * const_rows)
+
+	seen := 0
+	first := true
+	prev_stream: u64
+	prev_ts: i64
+	for &bi in merged.index {
+		d, ok := read_block(merged, &bi)
+		testing.expect(t, ok)
+		if !ok {
+			return
+		}
+		for ri in 0 ..< d.nrows {
+			r := &d.rows[ri]
+			if !first {
+				ordered := r.stream > prev_stream || (r.stream == prev_stream && r.ts >= prev_ts)
+				testing.expectf(t, ordered, "merge output out of order at row %d", seen)
+			}
+			prev_stream = r.stream
+			prev_ts = r.ts
+			first = false
+			seen += 1
+		}
+		decoded_destroy(&d)
+	}
+	testing.expect_value(t, seen, const_batches * const_rows)
 }

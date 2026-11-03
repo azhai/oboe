@@ -756,6 +756,8 @@ handle_metrics :: proc(srv: ^Server, out: ^common.Buf) {
 	common.buf_addf(out, "oboe_ingested_bytes_total %d\n", sync.atomic_load(&srv.store.ingested_bytes))
 	common.buf_addf(out, "oboe_queries_total %d\n", sync.atomic_load(&srv.store.queries))
 	common.buf_addf(out, "oboe_flushed_parts_total %d\n", sync.atomic_load(&srv.store.flushed_parts))
+	common.buf_addf(out, "oboe_flush_rows_total %d\n", sync.atomic_load(&srv.store.flushed_rows))
+	common.buf_addf(out, "oboe_flush_ms_last %d\n", sync.atomic_load(&srv.store.flush_ms_last))
 	common.buf_addf(out, "oboe_merged_parts_total %d\n", sync.atomic_load(&srv.store.merged_parts))
 	common.buf_addf(out, "oboe_parts %d\n", st.parts)
 	common.buf_addf(out, "oboe_partitions %d\n", st.partitions)

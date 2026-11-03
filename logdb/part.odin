@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 INDEX_MAGIC :: "ODLI"
@@ -43,6 +44,12 @@ Disk_Part :: struct {
 	data_file: ^os.File,
 	bloom:     []u8,
 	index:     []Block_Index,
+	// refs counts readers that captured the part pointer and still need to scan
+	// it. unlinked marks a part that has been removed from its partition (by a
+	// merge or retention); its last reader is responsible for closing it, so a
+	// query can keep scanning after the store lock is released.
+	refs:     i64,
+	unlinked: bool,
 }
 
 write_all :: proc(f: ^os.File, data: []u8) -> bool {
@@ -475,6 +482,34 @@ close_part :: proc(p: ^Disk_Part) {
 	delete(p.dir)
 	delete(p.meta.id)
 	free(p)
+}
+
+// part_retain must be called while holding the store's shared lock, so it
+// cannot race with the write-locked unlink.
+part_retain :: proc(p: ^Disk_Part) {
+	sync.atomic_add(&p.refs, 1)
+}
+
+// part_release drops a reader's reference and closes the part when it was
+// unlinked in the meantime. Only one caller can observe the transition to zero,
+// so the directory removal and close happen exactly once.
+part_release :: proc(p: ^Disk_Part) {
+	// atomic_sub returns the value before the subtraction.
+	if sync.atomic_sub(&p.refs, 1) == 1 && sync.atomic_load(&p.unlinked) {
+		os.remove_all(p.dir)
+		close_part(p)
+	}
+}
+
+// part_unlink detaches a part from the store. Callers must hold the exclusive
+// lock; readers that already captured the pointer keep it alive until they
+// release it.
+part_unlink :: proc(p: ^Disk_Part) {
+	sync.atomic_store(&p.unlinked, true)
+	if sync.atomic_load(&p.refs) == 0 {
+		os.remove_all(p.dir)
+		close_part(p)
+	}
 }
 
 part_bloom :: proc(p: ^Disk_Part, bi: ^Block_Index) -> Bloom {

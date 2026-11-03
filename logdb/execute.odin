@@ -622,7 +622,35 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 	tally := Scan_Tally{}
 	stop := false
 
+	// Only the part pointers are captured under the lock; the scan itself runs
+	// outside it. Rows in the memtable must be scanned while the lock is held
+	// because a flush swaps the memtable and destroys its arena. A flush needs
+	// the exclusive lock, so no row can move to a part between the snapshot and
+	// the memtable scan: every row is visited exactly once.
+	parts: [dynamic]^Disk_Part
+	defer {
+		for part in parts {
+			part_release(part)
+		}
+		delete(parts)
+	}
+	sync.atomic_add(&s.active_scans, 1)
+	defer sync.atomic_sub(&s.active_scans, 1)
+
 	sync.rw_mutex_shared_lock(&s.mu)
+	for p in s.partitions {
+		day_start := p.day * common.DAY_NS
+		if q.has_start && day_start + common.DAY_NS - 1 < q.start {
+			continue
+		}
+		if q.has_end && day_start > q.end {
+			continue
+		}
+		for part in p.parts {
+			part_retain(part)
+			append(&parts, part)
+		}
+	}
 	for p in s.partitions {
 		if stop {
 			break
@@ -633,54 +661,6 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 		}
 		if q.has_end && day_start > q.end {
 			continue
-		}
-		for part in p.parts {
-			if stop {
-				break
-			}
-			for &bi in part.index {
-				if stop {
-					break
-				}
-				blk := &bi
-				if q.has_start && blk.max_ts < q.start {
-					continue
-				}
-				if q.has_end && blk.min_ts > q.end {
-					continue
-				}
-				if q.filter != nil {
-					bl := part_bloom(part, blk)
-					if bl.bits != nil && !filter_bloom_may_match(q.filter, &bl) {
-						tally.pruned_blocks += 1
-						continue
-					}
-				}
-				d, ok := read_block(part, blk)
-				if !ok {
-					continue
-				}
-				tally.scanned_blocks += 1
-				tally.scanned_rows += d.nrows
-				for ri in 0..<d.nrows {
-					r := &d.rows[ri]
-					if q.has_start && r.ts < q.start {
-						continue
-					}
-					if q.has_end && r.ts > q.end {
-						continue
-					}
-					if q.filter != nil && !exec_match(q.filter, r) {
-						continue
-					}
-					tally.matched_rows += 1
-					if exec_consume(&st, r) {
-						stop = true
-						break
-					}
-				}
-				decoded_destroy(&d)
-			}
 		}
 		if stop {
 			break
@@ -713,6 +693,55 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 		}
 	}
 	sync.rw_mutex_shared_unlock(&s.mu)
+
+	for part in parts {
+		if stop {
+			break
+		}
+		for &bi in part.index {
+			if stop {
+				break
+			}
+			blk := &bi
+			if q.has_start && blk.max_ts < q.start {
+				continue
+			}
+			if q.has_end && blk.min_ts > q.end {
+				continue
+			}
+			if q.filter != nil {
+				bl := part_bloom(part, blk)
+				if bl.bits != nil && !filter_bloom_may_match(q.filter, &bl) {
+					tally.pruned_blocks += 1
+					continue
+				}
+			}
+			d, ok := read_block(part, blk)
+			if !ok {
+				continue
+			}
+			tally.scanned_blocks += 1
+			tally.scanned_rows += d.nrows
+			for ri in 0..<d.nrows {
+				r := &d.rows[ri]
+				if q.has_start && r.ts < q.start {
+					continue
+				}
+				if q.has_end && r.ts > q.end {
+					continue
+				}
+				if q.filter != nil && !exec_match(q.filter, r) {
+					continue
+				}
+				tally.matched_rows += 1
+				if exec_consume(&st, r) {
+					stop = true
+					break
+				}
+			}
+			decoded_destroy(&d)
+		}
+	}
 
 	if want_stats {
 		for i in 0..<len(groups) {
