@@ -275,9 +275,17 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	if len(rows) == 0 {
 		return 0
 	}
+	active := flush_profile_enabled()
+	t_entry := prof_stage_start(active)
+	t_locked: time.Time
 	total_bytes: i64
 	sync.rw_mutex_lock(&s.mu)
-	defer sync.rw_mutex_unlock(&s.mu)
+	if active {
+		t_locked = time.now()
+		sync.atomic_add(&flush_prof.ingest_wait_ns, u64(time.since(t_entry)))
+		sync.atomic_add(&flush_prof.ingest_calls, 1)
+		sync.atomic_add(&flush_prof.ingest_rows, u64(len(rows)))
+	}
 	now := common.now_ns()
 	for i in 0..<len(rows) {
 		r := &rows[i]
@@ -294,6 +302,11 @@ store_ingest :: proc(s: ^Store, rows: []Ingest_Row) -> int {
 	}
 	sync.atomic_add(&s.ingested_rows, u64(len(rows)))
 	sync.atomic_add(&s.ingested_bytes, u64(total_bytes))
+	sync.rw_mutex_unlock(&s.mu)
+	if active {
+		sync.atomic_add(&flush_prof.ingest_hold_ns, u64(time.since(t_locked)))
+		sync.atomic_add(&flush_prof.ingest_total_ns, u64(time.since(t_entry)))
+	}
 	return len(rows)
 }
 
@@ -375,23 +388,49 @@ store_flush_all :: proc(s: ^Store) {
 }
 
 store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
+	active := flush_profile_enabled()
+	t_entry := prof_stage_start(active)
+	t_locked: time.Time
 	sync.rw_mutex_lock(&s.mu)
+	if active {
+		t_locked = time.now()
+		flush_prof.flush_wait_ns += u64(time.since(t_entry))
+	}
 	if len(p.mem.rows) == 0 {
 		sync.rw_mutex_unlock(&s.mu)
+		if active {
+			flush_prof.flush_calls += 1
+			flush_prof.flush_total_ns += u64(time.since(t_entry))
+		}
 		return true
 	}
 	old_rows := p.mem.rows
 	old_arena := p.mem.arena
 	p.mem = Mem_Part{rows = make([dynamic]Row, 0, 4096)}
 	sync.rw_mutex_unlock(&s.mu)
+	if active {
+		// The swap is the only part of a flush that holds the write lock, so
+		// it is exactly what ingest batches have to wait for.
+		flush_prof.flush_swap_ns += u64(time.since(t_locked))
+	}
 
+	t := prof_stage_start(active)
 	sort_rows(old_rows[:])
+	if active {
+		ph := &flush_prof.phase[int(Prof_Scope.Flush)]
+		ph.sort_ns += prof_stage_end(true, t)
+		ph.sorts += 1
+	}
 	seq := sync.atomic_add(&s.seq, u64(1))
 	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
 	part, ok := write_part_parallel(part_dir, old_rows[:], s.cfg.block_rows, s.cfg.flush_threads)
 	delete(part_dir)
 	if ok {
+		t = prof_stage_start(active)
 		sync.rw_mutex_lock(&s.mu)
+		if active {
+			flush_prof.flush_append_wait_ns += u64(time.since(t))
+		}
 		append(&p.parts, part)
 		sync.rw_mutex_unlock(&s.mu)
 		sync.atomic_add(&s.flushed_parts, 1)
@@ -406,6 +445,11 @@ store_flush_partition :: proc(s: ^Store, p: ^Partition) -> bool {
 		sync.rw_mutex_unlock(&s.mu)
 	}
 	common.arena_destroy(&old_arena)
+	if active {
+		flush_prof.flush_calls += 1
+		flush_prof.flush_rows += u64(len(old_rows))
+		flush_prof.flush_total_ns += u64(time.since(t_entry))
+	}
 	delete(old_rows)
 	return ok
 }
@@ -463,10 +507,25 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 		delete(chosen)
 		return
 	}
+	active := flush_profile_enabled()
+	t_entry := prof_stage_start(active)
+	chosen_rows: u64
+	chosen_n := len(chosen)
+	for m in chosen {
+		chosen_rows += u64(m.meta.rows)
+	}
+	defer {
+		if active {
+			flush_prof.merge_calls += 1
+			flush_prof.merge_rows += chosen_rows
+			flush_prof.merged_parts += u64(chosen_n)
+			flush_prof.merge_total_ns += u64(time.since(t_entry))
+		}
+	}
 	seq := sync.atomic_add(&s.seq, u64(1))
 	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
 	defer delete(part_dir)
-	pw := part_writer_begin(part_dir, s.cfg.block_rows, true)
+	pw := part_writer_begin(part_dir, s.cfg.block_rows, true, .Merge)
 	if pw == nil {
 		delete(chosen)
 		return
@@ -479,6 +538,7 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 			any = true
 		}
 	}
+	t_loop := prof_stage_start(active)
 	for any {
 		best := -1
 		for i in 0..<len(cursors) {
@@ -510,6 +570,9 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 				break
 			}
 		}
+	}
+	if active {
+		flush_prof.merge_loop_ns += prof_stage_end(true, t_loop)
 	}
 	for i in 0..<len(cursors) {
 		cursor_destroy(&cursors[i])
@@ -604,7 +667,14 @@ cursor_advance :: proc(c: ^Part_Cursor) -> bool {
 		}
 		bi := &c.part.index[c.block_idx]
 		c.block_idx += 1
+		active := flush_profile_enabled()
+		t := prof_stage_start(active)
 		d, ok := read_block(c.part, bi)
+		if active {
+			flush_prof.merge_read_ns += prof_stage_end(true, t)
+			flush_prof.merge_read_blocks += 1
+			flush_prof.merge_read_bytes += u64(bi.raw_len)
+		}
 		if !ok {
 			continue
 		}

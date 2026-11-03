@@ -33,7 +33,10 @@ Params :: struct {
 	tube:       string,
 	rounds:     int,
 	value_size: int,
-	block_rows: int,
+	profile_reps: int,
+	block_rows:   int,
+	sort_threads: int,
+	flush_threads: int,
 }
 
 parse_params :: proc() -> Params {
@@ -54,7 +57,10 @@ parse_params :: proc() -> Params {
 		tube      = "bench",
 		rounds    = 20,
 		value_size = 64,
-		block_rows = 8192,
+		profile_reps = 3,
+		block_rows   = 8192,
+		sort_threads = 0,
+		flush_threads = 0,
 	}
 	args := os.args
 	i := 1
@@ -121,9 +127,21 @@ parse_params :: proc() -> Params {
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v); nok && n > 0 { p.value_size = n }
 			}
+		case "-profile-reps":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n > 0 { p.profile_reps = n }
+			}
 		case "-block-rows":
 			if v, ok := next_arg(args, &i); ok {
 				if n, nok := strconv.parse_int(v); nok && n > 0 { p.block_rows = n }
+			}
+		case "-sort-threads":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n >= 0 { p.sort_threads = n }
+			}
+		case "-flush-threads":
+			if v, ok := next_arg(args, &i); ok {
+				if n, nok := strconv.parse_int(v); nok && n >= 0 { p.flush_threads = n }
 			}
 		case "-h", "-help", "--help":
 			print_usage()
@@ -174,7 +192,10 @@ print_usage :: proc() {
   -rounds      bury+kick rounds                   (default 20)
   -tube        queue tube                         (default bench)
   -value-size  small cache value bytes            (default 64)
-  -block-rows  rows per storage block             (default 8192)`)
+  -block-rows    rows per block for flush-profile  (default 8192)
+  -profile-reps  flush-profile repetitions per tier (default 3)
+  -sort-threads  memtable sort threads, 0 = auto      (default 0)
+  -flush-threads part encode/compress threads, 0 = auto (default 0)`)
 }
 
 // ---------------------------------------------------------------- threads

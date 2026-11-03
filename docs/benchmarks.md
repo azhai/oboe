@@ -42,6 +42,7 @@
 | `bench/support.odin` | 参数解析、线程编排、最近秩百分位、JSON/人类可读输出 |
 | `bench/corpus.odin` | 固定的合成日志语料（level/service/zone/host/user/duration） |
 | `bench/ingest.odin` | 播种（写 store）与播种吞吐统计 |
+| `bench/flush_profile.odin` | `flush-profile`：真实刷盘/合并路径的分阶段图像、块大小分布、prof-off 对照 |
 | `bench/query.odin` | 4 类 LogsQL 查询的库内压测（无 HTTP）与 scanned/matched/pruned |
 | `bench/cache.odin` | 缓存 PUT/GET、命中/未命中、小值/接近上限大值 |
 | `bench/queue_tcp.odin` | beanstalk 子集 TCP 客户端：put/get/cycle/bury+kick |
@@ -123,12 +124,14 @@ oboe_bench -mode query   -reuse -data /tmp/d -threads 1 -reps 10 -warm 2 -json
 oboe_bench -mode cache   -threads 8 -ops 20000 -ops-large 1000 -value-size 64
 oboe_bench -mode queue-tcp -addr 127.0.0.1:12399 -qmode cycle -clients 8 -jobs 2000
 oboe_bench -mode all     -data /tmp/d
+oboe_bench -mode flush-profile -data /tmp/d -profile-reps 3 -block-rows 8192
 ```
 
 | 参数 | 含义 |
 |---|---|
-| `-mode ingest\|query\|cache\|queue-tcp\|all` | 子命令；`ingest` 默认写 `-data` |
+| `-mode ingest\|query\|cache\|queue-tcp\|all\|flush-profile` | 子命令；`ingest` 默认写 `-data` |
 | `-rows` / `-threads` / `-batch` | 播种行数、并发线程、每批行数 |
+| `-profile-reps` / `-block-rows` | `flush-profile` 每档重复次数（默认 3）、每块行数（默认 8192） |
 | `-reps` / `-warm` | 每类查询的测量次数与预热次数 |
 | `-ops` / `-ops-large` / `-value-size` | 缓存操作数、大值操作数、小值字节数 |
 | `-data` / `-keep` / `-reuse` | 数据目录；保留；复用已有数据 |
@@ -432,3 +435,133 @@ counter 单调；185 秒共服务 1666 万次 HTTP 请求和 25.8 万次查询�
 4. `$OUT/results/summary.md` 即本节表格；`raw.jsonl` 可自行重算；
    `shutdown.log` 记录被 SIGKILL 的收尾。
 5. `odin test tests -all-packages` 应为 87 个测试全部通过。
+
+## flush 阶段画像（步骤 0，2026-11-03）
+
+目标：把 `store_flush_partition`（单 part 刷盘）和 `store_merge_partition`（多路合并）
+拆成阶段计时，判断后续「P1 块级并行编码/压缩」和「P2 并行排序」值不值得做。
+本轮只插桩，不改刷盘顺序、块大小、压缩参数。
+
+### 结论
+
+1. **sort 是刷盘第一大成本**：500 万行档占 40.7%（2.41 s / 5.91 s），是 zlib（16.8%）
+   的 2.4 倍。排序比较器只比 `(stream, ts)` 两个整数，慢的原因是 5M 行（约 594 MiB）
+   在内存里随机访问，属于带宽/缓存受限，而不是比较逻辑。
+2. **压缩不是主成本，但仍是第二大单阶段**：zlib 占刷盘 16.8%（994 ms），合并里占 25.0%。
+   加上「行→列 + bloom 哈希」36.5%，块内可并行部分合计约 58.5%。
+3. **磁盘写入不是瓶颈**：data+bloom+index 的实际写入只占 0.6%（约 38 ms / 5M 行），
+   且代码里没有 fsync，也没有 rename，`store_close` 的 33 秒全部花在 CPU
+   （sort + encode + zlib），不是等盘。注意 `store_close` 还会 join 后台 worker
+   （最长等一个 250 ms tick）：小档 wall 456.6 ms、drain 430.8 ms，而 flush 本身
+   只有 205.6 ms，约 225 ms 是 worker 退出等待，不是刷盘。
+4. **flush 侧几乎不等锁**：`store_flush_partition` 抢写锁（swap memtable）在 500 万行档
+   为 0–132 ms（两轮之间不稳定，单轮标 `*`），swap 本身 7.5–10 µs/次。ingest 侧统计到的
+   34%「等锁」是 8 个 ingest 线程互相排队（每批持锁约 55 µs，串行 append 上限
+   ≈ 9.1M rows/s），不是刷盘抢占。
+5. **块足够大，可以并行**：500 万行一次刷盘 616 块，608 块是满块（8192 行、
+   平均 988 KiB 原始 / 46 KiB 压缩），原始块全部 ≤ 1 MiB。4 线程块级并行的粒度足够；
+   但 20 万行只有 28 块（24 满块），小刷盘的并行收益有限。
+6. **P1 值得做，但有上限**：块内阶段占 58.5%，4 线程理论上限
+   `1/(0.415+0.585/4)=1.80x`，实际受 8 个 ingest 线程争 CPU 和内存带宽影响，预期 1.4–1.7x。
+   **P2 也值得做，且单项收益更大**：数据只有 4 个 stream，按 stream 分段后各段
+   `(ts)` 已独立，可 4 路并行排序，理论上限 `1/(0.593+0.407/4)=1.44x`，实现也简单。
+   两步叠加（4 线程）理论上限约 3.9x；考虑带宽与实际可用核，落地预期 2–2.5x。
+   若只能选一个，先做 P2（sort 单项更大、改动更小）；按既定计划先 P1 也能把
+   merge 一起加速，随后 sort 会升到剩余时间的 ~69%，P2 的优先级反而更高。
+
+### 测量方法
+
+- worktree `/tmp/oboe_perf_ws`，基线 `32fed05`（`bench-suite` 当时已被另一会话推进到
+  `afff796`，该提交含 P1 并行刷盘；为保持「不改生产行为」，本次测量固定在 `32fed05`）。
+- 环境：Apple M4（10 逻辑核，macOS，APFS），Odin `dev-2026-10:84bc3fc21`；
+  `odin build bench -o:speed`，无 `-microarch`；后台 IDE 使 load avg ≈ 9，
+  绝对吞吐偏低，份额比绝对 ms 更可靠。
+- 参数：8 ingest 线程、batch 500、block_rows 8192、worker 刷盘间隔 1 s、
+  `flush_max_rows=200k`（与全套件一致），语料来自 `bench/corpus.odin`。
+- 每档 3 次重复取中位数；表中 `*` 表示该行三轮 `(max-min)/median > 30%`。
+  同一轮内的重复很稳；**整轮之间**的绝对耗时波动大：三轮 pipeline 分别为
+  4.06 / 5.75 / 5.91 s（负载逐步升高），下表用最后一轮。
+- 插桩：`logdb/profile.odin` 包级 profiler + 运行时开关，关闭时每个钩子只有一次
+  relaxed atomic load，无分配。prof-off 对照（同样 3 次）显示开启相对关闭
+  小档 −0.3%、大档 −0.2%～+2.7%（两轮），即插桩开销在噪声内。
+- encode 内的 bloom token 哈希无法在不改变单遍缓存行为的前提下剥离（两遍法会让
+  encode 膨胀约 20%），因此并入「encode:行→列+bloom哈希」；bloom 的定容/置位单列。
+
+### 刷盘分阶段（单 part，中位数）
+
+**20 万行**：ingest 23.5 ms（8.5M rows/s），flush 累计 205.6 ms，28 块，23.8 MiB 原始 → 1.5 MiB。
+
+| 阶段 | 次数 | 总耗时 ms | 占比 | 每 block µs | rows/s | 压缩比 |
+|---|---:|---:|---:|---:|---:|---:|
+| sort | 1 | 75.54 | 36.9% | – | 2.65M | – |
+| encode:行→列+bloom哈希 | 28 | 59.62 | 29.1% | 2129.4 | 3.35M | – |
+| encode:serialize | 28 | 16.97 | 8.3% | 606.1 | 11.78M | – |
+| zlib (level 1) | 28 | 38.58 | 18.8% | 1377.8 | 5.18M | 18.78x |
+| bloom:finish | 28 | 12.50 | 6.1% | 446.5 | 16.0M | – |
+| write data.bin | 28 | 0.96 | 0.5% | 34.2 | – | – |
+| write bloom.bin | 28 | 0.38 | 0.2% | 13.6 | – | – |
+| index + finish(index/meta/open) | 28 | 0.28 | 0.1% | – | – | – |
+| **流水线合计** | | **204.8** | **100%** | | **0.98M** | |
+
+**500 万行**：ingest 580.8 ms（8.6M rows/s），flush 累计 5933.0 ms（2 次），616 块，
+594.3 MiB 原始 → 32.5 MiB。
+
+| 阶段 | 次数 | 总耗时 ms | 占比 | 每 block µs | rows/s | 压缩比 |
+|---|---:|---:|---:|---:|---:|---:|
+| sort | 2 | 2407.69 | 40.7% | – | 2.08M | – |
+| encode:行→列+bloom哈希 | 616 | 1708.28 | 28.9% | 2773.2 | 2.93M | – |
+| encode:serialize | 616 | 450.13 | 7.6% | 730.7 | 11.1M | – |
+| zlib (level 1) | 616 | 994.13 | 16.8% | 1613.8 | 5.03M | 21.46x |
+| bloom:finish | 616 | 307.82 | 5.2% | 499.7 | 16.2M | – |
+| write data.bin | 616 | 25.88 | 0.4% | 42.0 | – | – |
+| write bloom.bin | 616 | 12.06 | 0.2% | 19.6 | – | – |
+| index + finish(index/meta/open) | 616 | 2.46 | 0.0% | – | – | – |
+| **流水线合计** | | **5908.5** | **100%** | | **0.85M** | |
+
+锁与 memtable 切换（只列与刷盘有交互的部分）：
+
+| 项 | 20 万行 | 500 万行 |
+|---|---|---|
+| ingest 等写锁（次数 / 每次 / 占流水线+锁） | 400 / 253 µs / 33.1% | 10000 / 304 µs / 34.0% |
+| flush 等写锁（swap 前） | 0 / 0 µs | 0–132 ms（2 次，单次 0–66 ms，不稳定 `*`） |
+| flush 追加 part 等锁 | <0.01 ms | <0.01 ms |
+| swap 本身（持锁） | 10 µs | 7.5 µs / 次 |
+
+块大小分布：20 万行 28 块（24 满 / 0 半 / 4 小块），平均 7143 行、869 KiB 原始 / 46 KiB 压缩；
+500 万行 616 块（608 满 / 4 半 / 4 小块），平均 8117 行、988 KiB 原始（135–1001 KiB）/ 46 KiB 压缩，
+原始块全部 ≤ 1 MiB。小块只出现在 stream 边界。
+
+### 合并分阶段（强制 8 个 part → 1 个，中位数）
+
+**500 万行**：merge 3945.9 ms（1.27M rows/s），输出 612 块；输入 640 块 / 594.3 MiB，读+inflate+decode 277.38 ms（2142 MiB/s）。
+
+| 阶段 | 次数 | 总耗时 ms | 占 merge | 每 block µs | rows/s | 压缩比 |
+|---|---:|---:|---:|---:|---:|---:|
+| k-way 主循环 | 1 | 3934.01 | 99.7% | – | 1.27M | – |
+| 输入读取+inflate+decode | 640 | 277.38 | 7.0% | 433.4 | 18.0M | – |
+| encode:行→列+bloom哈希 | 612 | 1445.00 | 36.6% | 2361.1 | 3.47M | – |
+| encode:serialize | 612 | 399.73 | 10.1% | 653.2 | 12.5M | – |
+| zlib (level 1) | 612 | 985.37 | 25.0% | 1610.1 | 5.07M | 21.57x |
+| bloom:finish | 612 | 310.57 | 7.9% | 507.5 | 15.9M | – |
+| write data+bloom | 612 | 43.15 | 1.1% | 70.5 | – | – |
+| **merge 总耗时** | 1 | **3945.90** | **100%** | | **1.27M** | |
+
+**20 万行**：merge 162.4 ms（1.23M rows/s），输出 28 块；输入 32 块 / 23.8 MiB，读 11.45 ms（2076 MiB/s）；
+encode 57.68 ms（35.5%）、serialize 15.88 ms（9.8%）、zlib 41.38 ms（25.5%）、bloom:finish 13.21 ms（8.1%）。
+
+k-way 主循环里还有未单列的逐行开销：500 万行约 473 ms（12.0%）、20 万行约 35 ms（22.5%），
+来自 8 路游标选路 + `part_writer_add`。后者在 merge 时 `copy_rows=true`，每行要把
+7 个字符串复制进 block arena，5M 行约 3500 万次分配+拷贝。这是 merge 独有的成本，
+P1/P2 都不会消除它。
+
+### 其他发现
+
+- `index:record` 只有 0.01 ms/块，`finish:index/meta/open` 合计 0.0%，索引与
+  bloom 的「构建」都不是瓶颈；bloom 的大头是逐行哈希（含在 encode 内）。
+- `finish:open+verify` 每次刷盘要重新打开 part、读回 index/bloom/meta，5M 档 1.8 ms/part，
+  可忽略。
+- 压缩比随档位变化：20 万行 18.78x，500 万行 21.46x，因为大档里重复值更多；
+  P1 若改用更高压缩级别会同时抬高 zlib 占比，收益判断时要一起看。
+- 本轮所有绝对吞吐低于文档前面记录的 1.0–2.1M rows/s，原因是后台 load avg ≈ 9；
+  同机重复三轮的 pipeline 为 4.06/5.75/5.91 s，说明份额结论稳定、绝对值不要跨机对比。
+

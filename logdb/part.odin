@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:time"
 
 INDEX_MAGIC :: "ODLI"
 INDEX_VERSION :: u16(1)
@@ -104,14 +105,16 @@ Part_Writer :: struct {
 	max_ts:     i64,
 	ok:         bool,
 	copy_rows:  bool,
+	prof_scope: Prof_Scope,
 }
 
-part_writer_begin :: proc(part_dir: string, block_rows: int, copy_rows: bool) -> ^Part_Writer {
+part_writer_begin :: proc(part_dir: string, block_rows: int, copy_rows: bool, prof_scope := Prof_Scope.Flush) -> ^Part_Writer {
 	os.make_directory_all(part_dir)
 	pw := new(Part_Writer)
 	pw.dir = strings.clone(part_dir)
 	pw.block_rows = block_rows
 	pw.copy_rows = copy_rows
+	pw.prof_scope = prof_scope
 	pw.data_path = fmt.aprintf("%s/data.bin", part_dir)
 	pw.bloom_path = fmt.aprintf("%s/bloom.bin", part_dir)
 	pw.index_path = fmt.aprintf("%s/index.bin", part_dir)
@@ -171,28 +174,56 @@ part_writer_flush_block :: proc(pw: ^Part_Writer) -> bool {
 	if len(pw.rows) == 0 {
 		return true
 	}
+	active := flush_profile_enabled()
+	ph: ^Phase_Stats
+	if active {
+		ph = &flush_prof.phase[int(pw.prof_scope)]
+	}
 	bloom_builder_reset(&pw.bloom_b)
-	bmin, bmax, eok := encode_block(pw.rows[:], &pw.block_buf, &pw.bloom_b)
+	bmin, bmax, eok := encode_block(pw.rows[:], &pw.block_buf, &pw.bloom_b, ph)
 	if !eok {
 		pw.ok = false
 		return false
 	}
+	t := prof_stage_start(active)
 	comp, cok := common.zlib_compress(pw.block_buf.data[:], 1)
+	if active {
+		ph.zlib_ns += prof_stage_end(true, t)
+	}
 	if !cok {
 		pw.ok = false
 		return false
 	}
 	defer delete(comp)
-	if !write_all(pw.data_file, comp) {
+	t = prof_stage_start(active)
+	data_ok := write_all(pw.data_file, comp)
+	if active {
+		ph.write_data_ns += prof_stage_end(true, t)
+		ph.data_bytes += u64(len(comp))
+	}
+	if !data_ok {
 		pw.ok = false
 		return false
 	}
+	t = prof_stage_start(active)
 	bloom_bits := bloom_builder_finish(&pw.bloom_b)
+	if active {
+		ph.bloom_finish_ns += prof_stage_end(true, t)
+		ph.bloom_bytes += u64(len(bloom_bits))
+	}
+	// bloom_builder_finish returns freshly allocated bits; the write must
+	// happen before the deferred delete.
 	defer delete(bloom_bits)
-	if !write_all(pw.bloom_file, bloom_bits) {
+	t = prof_stage_start(active)
+	bloom_ok := write_all(pw.bloom_file, bloom_bits)
+	if active {
+		ph.write_bloom_ns += prof_stage_end(true, t)
+	}
+	if !bloom_ok {
 		pw.ok = false
 		return false
 	}
+	t = prof_stage_start(active)
 	common.buf_u64le(&pw.index_buf, pw.stream)
 	common.buf_i64le(&pw.index_buf, bmin)
 	common.buf_i64le(&pw.index_buf, bmax)
@@ -204,6 +235,9 @@ part_writer_flush_block :: proc(pw: ^Part_Writer) -> bool {
 	common.buf_u64le(&pw.index_buf, pw.bloom_off)
 	common.buf_u32le(&pw.index_buf, u32(len(bloom_bits)))
 	common.buf_u32le(&pw.index_buf, 0)
+	if active {
+		ph.index_ns += prof_stage_end(true, t)
+	}
 	pw.data_off += u64(len(comp))
 	pw.bloom_off += u64(len(bloom_bits))
 	pw.nblocks += 1
@@ -213,6 +247,9 @@ part_writer_flush_block :: proc(pw: ^Part_Writer) -> bool {
 	}
 	if bmax > pw.max_ts {
 		pw.max_ts = bmax
+	}
+	if active {
+		flush_profile_record_block(pw.prof_scope, len(pw.rows), len(pw.block_buf.data), len(comp))
 	}
 	clear(&pw.rows)
 	common.arena_reset(&pw.arena)
@@ -224,11 +261,17 @@ part_writer_finish :: proc(pw: ^Part_Writer) -> (^Disk_Part, bool) {
 		part_writer_abort(pw)
 		return nil, false
 	}
+	active := flush_profile_enabled()
+	ph: ^Phase_Stats
+	if active {
+		ph = &flush_prof.phase[int(pw.prof_scope)]
+	}
 	os.close(pw.data_file)
 	pw.data_file = nil
 	os.close(pw.bloom_file)
 	pw.bloom_file = nil
 	common.buf_put_u32_at(&pw.index_buf, 8, pw.nblocks)
+	t := prof_stage_start(active)
 	index_file, ierr := os.open(pw.index_path, {.Write, .Create, .Trunc})
 	if ierr != nil {
 		part_writer_abort(pw)
@@ -236,6 +279,9 @@ part_writer_finish :: proc(pw: ^Part_Writer) -> (^Disk_Part, bool) {
 	}
 	iok := write_all(index_file, pw.index_buf.data[:])
 	os.close(index_file)
+	if active {
+		ph.finish_index_ns += prof_stage_end(true, t)
+	}
 	if !iok {
 		part_writer_abort(pw)
 		return nil, false
@@ -252,6 +298,7 @@ part_writer_finish :: proc(pw: ^Part_Writer) -> (^Disk_Part, bool) {
 		index_size = i64(len(pw.index_buf.data)),
 		created_ns = common.now_ns(),
 	}
+	t = prof_stage_start(active)
 	meta_bytes, merr := json.marshal(meta)
 	if merr != nil {
 		part_writer_abort(pw)
@@ -262,13 +309,23 @@ part_writer_finish :: proc(pw: ^Part_Writer) -> (^Disk_Part, bool) {
 		part_writer_abort(pw)
 		return nil, false
 	}
+	if active {
+		ph.finish_meta_ns += prof_stage_end(true, t)
+	}
 	dir := strings.clone(pw.dir)
 	part_writer_destroy(pw)
+	t = prof_stage_start(active)
 	p, pok := open_part(dir)
+	if active {
+		ph.finish_open_ns += prof_stage_end(true, t)
+	}
 	if !pok {
 		os.remove_all(dir)
 		delete(dir)
 		return nil, false
+	}
+	if active {
+		ph.parts += 1
 	}
 	delete(dir)
 	return p, true

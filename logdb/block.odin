@@ -1,6 +1,8 @@
 package logdb
 
 import "../common"
+import "core:time"
+
 Row :: struct {
 	ts:     i64,
 	stream: u64,
@@ -18,10 +20,14 @@ Enc_Col :: struct {
 
 // encode_block serializes rows into a columnar block. All rows must belong to
 // the same stream. The returned timestamp bounds are also written in the header.
-encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (min_ts, max_ts: i64, ok: bool) {
+// prof, when non-nil, splits the row loop into a column pass and a bloom
+// pass so the two costs can be attributed separately; the serialized bytes
+// are identical either way.
+encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder, prof: ^Phase_Stats = nil) -> (min_ts, max_ts: i64, ok: bool) {
 	if len(rows) == 0 {
 		return 0, 0, false
 	}
+	t := prof_stage_start(prof != nil)
 	min_ts = rows[0].ts
 	max_ts = rows[0].ts
 	for r in rows {
@@ -40,19 +46,26 @@ encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (m
 		delete(cols)
 	}
 	nrows := len(rows)
-	for ri in 0..<nrows {
-		r := &rows[ri]
-		ci := find_enc_col(&cols, "_msg", nrows)
-		cols[ci].vals[ri] = r.msg
-		for f in r.fields {
-			ci = find_enc_col(&cols, f.name, nrows)
-			cols[ci].vals[ri] = f.value
+	// The row loop is kept exactly as in production (columns and bloom hashing
+	// interleaved); splitting it would change cache behaviour and inflate the
+	// measured cost. bloom token hashing therefore stays inside collect_ns.
+	if prof != nil {
+		t = prof_stage_start(true)
+		for ri in 0..<nrows {
+			r := &rows[ri]
+			encode_row_columns(&cols, r, ri, nrows)
+			encode_row_bloom(bloom, r)
 		}
-		bloom_builder_add_value(bloom, "_msg", r.msg)
-		for f in r.fields {
-			bloom_builder_add_value(bloom, f.name, f.value)
+		prof.collect_ns += prof_stage_end(true, t)
+	} else {
+		for ri in 0..<nrows {
+			r := &rows[ri]
+			encode_row_columns(&cols, r, ri, nrows)
+			encode_row_bloom(bloom, r)
 		}
 	}
+
+	t = prof_stage_start(prof != nil)
 	common.buf_reset(out)
 	common.buf_string(out, BLOCK_MAGIC)
 	common.buf_u16le(out, BLOCK_VERSION)
@@ -88,7 +101,31 @@ encode_block :: proc(rows: []Row, out: ^common.Buf, bloom: ^Bloom_Builder) -> (m
 			}
 		}
 	}
+	if prof != nil {
+		prof.serialize_ns += prof_stage_end(true, t)
+	}
 	return min_ts, max_ts, true
+}
+
+// encode_row_columns fills the per-column string arrays for row ri. Kept
+// separate so the profiled path can time column collection independently from
+// bloom hashing without changing what is written.
+@(private)
+encode_row_columns :: #force_inline proc(cols: ^[dynamic]Enc_Col, r: ^Row, ri, nrows: int) {
+	ci := find_enc_col(cols, "_msg", nrows)
+	cols[ci].vals[ri] = r.msg
+	for f in r.fields {
+		ci = find_enc_col(cols, f.name, nrows)
+		cols[ci].vals[ri] = f.value
+	}
+}
+
+@(private)
+encode_row_bloom :: #force_inline proc(bloom: ^Bloom_Builder, r: ^Row) {
+	bloom_builder_add_value(bloom, "_msg", r.msg)
+	for f in r.fields {
+		bloom_builder_add_value(bloom, f.name, f.value)
+	}
 }
 
 find_enc_col :: proc(cols: ^[dynamic]Enc_Col, name: string, nrows: int) -> int {

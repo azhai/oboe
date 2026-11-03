@@ -56,6 +56,13 @@ ingest_worker :: proc(data: rawptr) {
 
 // fill_store writes `rows` rows concurrently and returns the wall time.
 fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> time.Duration {
+	return fill_store_range(s, rows, threads, batch, base_ts, 0, rows)
+}
+
+// fill_store_range writes rows [offset, offset+rows) of a corpus of `total`
+// rows, so a tier can be ingested in successive chunks with timestamps spread
+// over the same window.
+fill_store_range :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64, offset0, total: int) -> time.Duration {
 	corpus := corpus_make()
 	defer corpus_destroy(&corpus)
 
@@ -68,7 +75,7 @@ fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> 
 	}
 	per := rows / threads
 	rem := rows % threads
-	offset := 0
+	offset := offset0
 	for i in 0..<threads {
 		n := per
 		if i < rem {
@@ -81,7 +88,7 @@ fill_store :: proc(s: ^logdb.Store, rows, threads, batch: int, base_ts: i64) -> 
 			base_ts = base_ts,
 			offset = offset,
 			rows   = n,
-			total  = rows,
+			total  = total,
 			batch  = batch,
 		}
 		offset += n
