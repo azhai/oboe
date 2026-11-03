@@ -673,3 +673,92 @@ pdqsort，并列次序本就取决于初始位置）；查询结果不受影响�
 环境与上一节相同：Apple M4（10 逻辑核）、macOS/APFS、`odin build bench -o:speed`、无
 `-microarch`；所有对比都在同一天同一台机器上重测，避免跨轮的 load 差异。
 
+## merge 零拷贝引用源块（2026-11-03）
+
+### 结论
+
+- **先量准**：merge 时 `copy_rows=true` 的逐行复制在本窗口内是 **1083.6 ms / 占 merge 10.7%**
+  （500 万行），不是此前凭差额估的 473 ms；20 万行同样是 10.7%（43.2 ms）。差额估计偏低
+  是因为复制成本的一部分被记在了 encode 的缓存代价里。行均 **14 次 arena 分配**
+  （1 次 `msg` + 1 次 fields 数组 + 6 个字段 × 2 个字符串）、**329 B/行**，500 万行合计
+  **7000 万次分配 / 1567 MiB 拷贝**，20 万行 280 万次 / 63 MiB。
+- 因此 `copy_rows` 的**理论上限只有 1/(1-0.107) = 1.12x**，用户要求的 1.2x 在这个瓶颈结构下
+  不可能达成。实测消除后 merge 快 **1.15x（20 万行）/ 1.18x（500 万行）**，略高于上限
+  是因为少写 1567 MiB 也让紧随其后的 encode 变快（collect 4964 → 4796 ms）。
+- **做法不是「批量分配 arena」，而是彻底不复制**：merge 输出块直接引用已解码的源块，
+  源块改为「pin 到输出块 flush 之后再释放」。分配次数从 7000 万降到 0，拷贝字节数降到 0；
+  同时删掉了 `Part_Writer` 里的 arena（刷盘路径本来就不用它）。
+- merge 里真正的瓶颈在别处：**encode:行→列+bloom哈希 56.0%**、bloom:finish 15.0%、
+  zlib 8.6%、serialize 7.1%、输入读 8.6%。所以下一轮该做 encode，不是 zlib。
+
+### 实现
+
+合并主循环原本把每一行的 `msg` 与 6 个字段字符串逐个复制进 part writer 的 arena，
+目的只是让这些 `string` 在解码块被释放后仍然有效。改成：
+
+1. `part_writer_add` 不再复制任何字符串（`Part_Writer.copy_rows` 与 `arena` 字段一并删除）；
+   `part_writer_begin` 只保留 `prof_scope`，写盘路径 `write_part` / `write_part_parallel`
+   本来就把整行数组活到 flush，契约不变。
+2. `cursor_advance` 增加可选 `pins` 参数：块读完时不 `decoded_destroy`，而是把整个
+   `Decoded_Block` 交给 merge 的 pin 列表；查询路径不传 `pins`，行为不变。
+3. merge 在 `part_writer_add` 返回后比较 `pw.nblocks`：只有真的 flush 了输出块
+   （`pw.rows` 已清空）才释放 pin。最后一个块由 `part_writer_finish` flush，pin 列表在
+   proc 结尾统一释放。
+4. pin 的同时存活上限是**游标数**（默认 8）：一个游标要消耗 8192 行才退役一块，而
+   8192 行必然触发输出块 flush，所以两次 flush 之间每个游标最多退役一块。实测 500 万行
+   累计 pin 640 块 / 594.3 MiB，同时存活 ≤ 8 块（约 8 MiB）。
+
+不变的部分：块内仍是同一条 `encode_block`、同一个 zlib 参数、同样的块边界，
+所以 `data.bin` / `bloom.bin` / `index.bin` 逐字节相同（见下）。
+
+### 前后对比（同一台机器、同一天、3 次中位数）
+
+merge 总耗时：
+
+| tier | 改前 | 改后 | 加速 |
+|---|---:|---:|---:|
+| 20 万行 | 404.2 ms（0.495M rows/s） | 352.3 ms（0.568M rows/s） | **1.15x** |
+| 500 万行 | 10083.0 ms（0.496M rows/s） | 8557.9 ms（0.584M rows/s） | **1.18x** |
+
+500 万行分阶段（同一窗口，改前/改后）：
+
+| 阶段 | 改前 ms | 占比 | 改后 ms | 占比 |
+|---|---:|---:|---:|---:|
+| 输入读取+inflate+decode | 738.2 | 7.3% | 735.2 | 8.6% |
+| **逐行 copy(arena)** | **1083.6** | **10.7%** | **0（删除）** | – |
+| encode:行→列+bloom哈希 | 4964.3 | 49.2% | 4796.5 | 56.0% |
+| encode:serialize | 640.5 | 6.4% | 605.6 | 7.1% |
+| zlib (level 1) | 746.3 | 7.4% | 740.2 | 8.6% |
+| bloom:finish | 1287.2 | 12.8% | 1282.8 | 15.0% |
+| write data+bloom | 176.1 | 1.7% | 11.5 | 0.1% |
+| **merge 总耗时** | **10083.0** | **100%** | **8557.9** | **100%** |
+
+20 万行：copy 43.2 ms（10.7%）→ 0；encode 197.6 → 191.2；serialize 25.9 → 24.3；
+zlib 31.0 → 31.1；bloom:finish 51.5 → 51.9；merge 404.2 → 352.3。
+
+（本窗口后台 load 比上一节高，绝对值整体放大约 2.5x；份额与同窗口前后比值才是结论依据。
+`write data+bloom` 两轮差异属 I/O 抖动，改前行带 `*`。）
+
+### 字节一致性与新增测试
+
+新增 `logdb` 包内测试 `test_store_more_merge_zero_copy_part_bytes_match`：
+3 批 × 40 行（3 条 stream、block_rows=32、merge_threshold=3）刷盘后 merge，
+再把同一批行按 `(stream, ts)` 排好直接用 `write_part` 写一个参考 part，逐字节比对
+`data.bin` / `bloom.bin` / `index.bin`。这保证「引用源块」和原来的「复制进 arena」
+产出完全一致，part 格式没有被改动。
+
+### 取舍
+
+- 语义变化只在**内存生命周期**：解码块晚于「读完」释放，最多同时多留 8 个块（≈8 MiB）。
+  行内容、块边界、索引、bloom 全部不变。
+- 峰值内存互换：原来每次输出块要 bump 约 1 MiB 的 arena，现在改为持有 8 个已解码块；
+  两者同量级，未观察到 RSS 上升。
+- merge 不是多线程并发的（一条 partition 一个 merge），pin 列表不需要加锁。
+
+### 回归
+
+- `odin build cmd` / `odin build bench` ✅；`odin test tests -all-packages` **95 全绿**
+  （94 基线 + 本轮的字节一致测试），`-define:ODIN_STRESS=1` 99 全绿。
+- `bench/run_matrix.sh --only small --reps 1 --no-soak` 播种与查询无退化（见下）。
+- `flush-profile` prof-off 自对照：20 万 −0.5%、500 万 −0.6%，插桩开销在噪声内。
+

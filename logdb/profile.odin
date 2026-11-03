@@ -89,6 +89,10 @@ Flush_Profile :: struct {
 	merge_read_ns:     u64,
 	merge_read_blocks: u64,
 	merge_read_bytes:  u64,
+	// merge output: decoded source blocks kept alive until the output block is
+	// encoded, so rows can be referenced instead of copied into an arena
+	merge_pin_blocks: u64,
+	merge_pin_bytes:  u64,
 
 	block_rows: u64,
 	phase:      [2]Phase_Stats,

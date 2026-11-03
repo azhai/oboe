@@ -156,12 +156,12 @@ profile_merge_run :: proc(p: Params, tier: string, rows, rep: int) -> Profile_Ru
 profile_json_line :: proc(tier, scenario: string, rep: int, r: Profile_Run) {
 	ph := r.prof.phase[0]
 	fmt.printf(
-		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"sort_scatter_ms":%.2f,"sort_segment_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d}}`,
+		`{{"scenario":"flush_profile","kind":"%s","tier":"%s","rep":%d,"rows":%d,"wall_ms":%.1f,"ingest_ms":%.1f,"drain_ms":%.1f,"blocks":%d,"zlib_ms":%.2f,"sort_ms":%.2f,"sort_scatter_ms":%.2f,"sort_segment_ms":%.2f,"write_ms":%.2f,"flush_wait_ms":%.2f,"raw_bytes":%d,"comp_bytes":%d,"merge_pin_blocks":%d}}`,
 		scenario, tier, rep, r.rows, r.wall_ms, r.ingest_ms, r.drain_ms,
 		ph.blocks, f64(ph.zlib_ns)/1e6, f64(ph.sort_ns)/1e6,
 		f64(ph.sort_scatter_ns)/1e6, f64(ph.sort_segment_ns)/1e6,
 		f64(ph.write_data_ns+ph.write_bloom_ns)/1e6, f64(r.prof.flush_wait_ns)/1e6,
-		ph.raw_bytes, ph.comp_bytes,
+		ph.raw_bytes, ph.comp_bytes, r.prof.merge_pin_blocks,
 	)
 	fmt.println()
 }
@@ -247,6 +247,10 @@ profile_print_merge :: proc(p: Params, tier: string, rows: int, runs: []Profile_
 	stage_row("merge 总耗时", med.merge_calls, total, lo.merge_total_ns, hi.merge_total_ns, 0, med.merge_rows, total, 0, 0)
 	stage_row("k-way 主循环", med.merge_calls, med.merge_loop_ns, lo.merge_loop_ns, hi.merge_loop_ns, 0, med.merge_rows, total, 0, 0)
 	stage_row("输入读取+inflate", med.merge_read_blocks, med.merge_read_ns, lo.merge_read_ns, hi.merge_read_ns, 0, med.merge_rows, total, 0, 0)
+	if med.merge_pin_blocks > 0 {
+		fmt.printf("  零拷贝：输出块引用已解码源块，累计 pin %d 个 / %.1f MiB（每次输出块 flush 后释放，同时存活不超过游标数；原先每行 14 次 arena 分配 + 拷贝）\n",
+			med.merge_pin_blocks, f64(med.merge_pin_bytes)/(1<<20))
+	}
 	stage_row("encode:行→列+bloom哈希", blocks, ph.collect_ns, lph.collect_ns, hph.collect_ns, blocks, ph.rows, total, 0, 0)
 	stage_row("encode:serialize", blocks, ph.serialize_ns, lph.serialize_ns, hph.serialize_ns, blocks, ph.rows, total, 0, 0)
 	stage_row("zlib (level 1)", blocks, ph.zlib_ns, lph.zlib_ns, hph.zlib_ns, blocks, ph.rows, total, ph.raw_bytes, ph.comp_bytes)

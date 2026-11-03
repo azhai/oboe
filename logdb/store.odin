@@ -545,16 +545,28 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 	seq := sync.atomic_add(&s.seq, u64(1))
 	part_dir := fmt.aprintf("%s/parts/p_%016x", p.dir, seq)
 	defer delete(part_dir)
-	pw := part_writer_begin(part_dir, s.cfg.block_rows, true, .Merge)
+	pw := part_writer_begin(part_dir, s.cfg.block_rows, .Merge)
 	if pw == nil {
 		delete(chosen)
 		return
+	}
+	// The merged rows point into the decoded source blocks, so the part writer
+	// does not copy them (no 14 arena allocations per row). A retired block can
+	// still back rows that are buffered in pw, so it is pinned until the next
+	// block flush clears pw.rows; at most one block per cursor retires between
+	// two flushes, so the pin set stays at most len(cursors) blocks.
+	pins: [dynamic]Decoded_Block
+	defer {
+		for &d in pins {
+			decoded_destroy(&d)
+		}
+		delete(pins)
 	}
 	cursors := make([]Part_Cursor, len(chosen))
 	any := false
 	for i in 0..<len(chosen) {
 		cursor_init(&cursors[i], chosen[i])
-		if cursor_advance(&cursors[i]) {
+		if cursor_advance(&cursors[i], &pins) {
 			any = true
 		}
 	}
@@ -573,6 +585,7 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 		if best < 0 {
 			break
 		}
+		nblocks_before := pw.nblocks
 		if !part_writer_add(pw, cursors[best].row) {
 			for i in 0..<len(cursors) {
 				cursor_destroy(&cursors[i])
@@ -582,7 +595,10 @@ store_merge_partition :: proc(s: ^Store, p: ^Partition) {
 			delete(chosen)
 			return
 		}
-		cursor_advance(&cursors[best])
+		if pw.nblocks != nblocks_before {
+			merge_drop_pins(&pins)
+		}
+		cursor_advance(&cursors[best], &pins)
 		any = false
 		for i in 0..<len(cursors) {
 			if cursors[i].has_row {
@@ -669,7 +685,16 @@ cursor_destroy :: proc(c: ^Part_Cursor) {
 	c.has_row = false
 }
 
-cursor_advance :: proc(c: ^Part_Cursor) -> bool {
+// merge_drop_pins releases blocks whose rows have all been flushed. Only called
+// right after part_writer_add flushed a block, which cleared its row buffer.
+merge_drop_pins :: proc(pins: ^[dynamic]Decoded_Block) {
+	for &d in pins {
+		decoded_destroy(&d)
+	}
+	clear(pins)
+}
+
+cursor_advance :: proc(c: ^Part_Cursor, pins: ^[dynamic]Decoded_Block = nil) -> bool {
 	for {
 		if c.decoded.buf != nil && c.next_row < c.decoded.nrows {
 			c.row = c.decoded.rows[c.next_row]
@@ -678,7 +703,17 @@ cursor_advance :: proc(c: ^Part_Cursor) -> bool {
 			return true
 		}
 		if c.decoded.buf != nil {
-			decoded_destroy(&c.decoded)
+			// A merge hands the exhausted block over instead of freeing it, because
+			// rows already buffered in the part writer still point into it.
+			if pins != nil {
+				append(pins, c.decoded)
+				if flush_profile_enabled() {
+					flush_prof.merge_pin_blocks += 1
+					flush_prof.merge_pin_bytes += u64(len(c.decoded.buf))
+				}
+			} else {
+				decoded_destroy(&c.decoded)
+			}
 			c.decoded = {}
 		}
 		if c.block_idx >= len(c.part.index) {

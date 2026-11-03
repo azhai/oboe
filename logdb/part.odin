@@ -93,7 +93,6 @@ Part_Writer :: struct {
 	block_buf:  common.Buf,
 	bloom_b:    Bloom_Builder,
 	rows:       [dynamic]Row,
-	arena:      common.Arena,
 	block_rows: int,
 	stream:     u64,
 	has_stream: bool,
@@ -104,16 +103,17 @@ Part_Writer :: struct {
 	min_ts:     i64,
 	max_ts:     i64,
 	ok:         bool,
-	copy_rows:  bool,
 	prof_scope: Prof_Scope,
 }
 
-part_writer_begin :: proc(part_dir: string, block_rows: int, copy_rows: bool, prof_scope := Prof_Scope.Flush) -> ^Part_Writer {
+// The writer only buffers the rows handed to part_writer_add; it never owns or
+// copies their strings. Callers either keep the rows alive until the block is
+// flushed (write_part) or pin the decoded source blocks they point into (merge).
+part_writer_begin :: proc(part_dir: string, block_rows: int, prof_scope := Prof_Scope.Flush) -> ^Part_Writer {
 	os.make_directory_all(part_dir)
 	pw := new(Part_Writer)
 	pw.dir = strings.clone(part_dir)
 	pw.block_rows = block_rows
-	pw.copy_rows = copy_rows
 	pw.prof_scope = prof_scope
 	pw.data_path = fmt.aprintf("%s/data.bin", part_dir)
 	pw.bloom_path = fmt.aprintf("%s/bloom.bin", part_dir)
@@ -152,18 +152,6 @@ part_writer_add :: proc(pw: ^Part_Writer, row: Row) -> bool {
 		}
 	}
 	r := row
-	if pw.copy_rows {
-		r.msg = common.arena_str(&pw.arena, row.msg)
-		fields := common.arena_alloc(&pw.arena, len(row.fields) * size_of(Field), align_of(Field))
-		fs := slice.from_ptr(cast(^Field)raw_data(fields), len(row.fields))
-		for i in 0..<len(row.fields) {
-			fs[i] = Field{
-				name = common.arena_str(&pw.arena, row.fields[i].name),
-				value = common.arena_str(&pw.arena, row.fields[i].value),
-			}
-		}
-		r.fields = fs
-	}
 	pw.stream = row.stream
 	pw.has_stream = true
 	append(&pw.rows, r)
@@ -252,7 +240,6 @@ part_writer_flush_block :: proc(pw: ^Part_Writer) -> bool {
 		flush_profile_record_block(pw.prof_scope, len(pw.rows), len(pw.block_buf.data), len(comp))
 	}
 	clear(&pw.rows)
-	common.arena_reset(&pw.arena)
 	return true
 }
 
@@ -350,7 +337,6 @@ part_writer_destroy :: proc(pw: ^Part_Writer) {
 	delete(pw.bloom_b.hashes)
 	delete(pw.bloom_b.table)
 	delete(pw.rows)
-	common.arena_destroy(&pw.arena)
 	delete(pw.dir)
 	delete(pw.data_path)
 	delete(pw.bloom_path)
@@ -363,7 +349,7 @@ write_part :: proc(part_dir: string, rows: []Row, block_rows: int) -> (^Disk_Par
 	if len(rows) == 0 {
 		return nil, false
 	}
-	pw := part_writer_begin(part_dir, block_rows, false)
+	pw := part_writer_begin(part_dir, block_rows)
 	if pw == nil {
 		return nil, false
 	}

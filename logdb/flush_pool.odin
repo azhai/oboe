@@ -233,7 +233,7 @@ write_part_parallel :: proc(part_dir: string, rows: []Row, block_rows, threads: 
 	if len(rows) == 0 {
 		return nil, false
 	}
-	pw := part_writer_begin(part_dir, block_rows, false)
+	pw := part_writer_begin(part_dir, block_rows)
 	if pw == nil {
 		return nil, false
 	}
