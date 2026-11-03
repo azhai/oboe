@@ -879,3 +879,54 @@ test_concurrent_query_and_retention :: proc(t: ^testing.T) {
 	st := store_stats(s)
 	testing.expect_value(t, st.rows, const_new_rows)
 }
+
+// The merge worker must keep the part count bounded on its own: before P5 the
+// flush worker merged at most once every 10 s, so a chunked flush (one part per
+// flush_max_rows) outran the merge and parts piled up. This drives only the
+// public ingest path and waits for the workers to settle.
+@(test)
+test_merge_worker_keeps_parts_bounded :: proc(t: ^testing.T) {
+	dir := sm_tmpdir("merge_worker")
+	defer delete(dir)
+	os.remove_all(dir)
+	cfg := default_store_config()
+	cfg.data_path = dir
+	cfg.flush_interval = time.Duration(5_000_000) // 5 ms
+	cfg.flush_max_rows = 1000
+	cfg.flush_max_bytes = 1 << 40
+	cfg.block_rows = 64
+	cfg.merge_threshold = 3
+	cfg.merge_max_rows = 100_000
+	// The rows below carry 2023 timestamps, so retention (30 days by default) would
+	// delete the partition as soon as the worker runs; this test only cares about
+	// flush and merge.
+	cfg.retention_days = 0
+	s := store_init(cfg, true)
+	fields := []Field{{name = "level", value = "info"}}
+	rows := make([]Ingest_Row, 6000)
+	defer delete(rows)
+	base := i64(1_700_000_000_000_000_000)
+	for i in 0..<6000 {
+		rows[i] = Ingest_Row{ts = base + i64(i) * 1_000_000, stream = u64(i % 4), msg = "merge worker", fields = fields}
+	}
+	// Six batches of flush_max_rows force six parts without the test calling
+	// store_flush_all or store_merge_all itself.
+	for i in 0..<6 {
+		store_ingest(s, rows[i * 1000:(i + 1) * 1000])
+	}
+	for _ in 0..<2000 {
+		st := store_stats(s)
+		// mem_rows drops as soon as the memtable is swapped, before the part is
+		// written, so wait for the rows to land on disk too. The test runner runs
+		// packages in parallel, so give the workers room to finish.
+		if st.mem_rows == 0 && st.rows == 6000 && st.parts <= cfg.merge_threshold {
+			break
+		}
+		time.sleep(5 * time.Millisecond)
+	}
+	st := store_stats(s)
+	testing.expect_value(t, st.mem_rows, 0)
+	testing.expect_value(t, st.rows, 6000)
+	testing.expect(t, st.parts <= cfg.merge_threshold)
+	store_close(s)
+}

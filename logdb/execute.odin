@@ -638,6 +638,9 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 	defer sync.atomic_sub(&s.active_scans, 1)
 
 	sync.rw_mutex_shared_lock(&s.mu)
+	// The parts list has its own mutex: a flush appends and a merge replaces parts
+	// without taking mu's write side, so every reader of parts takes parts_mu.
+	sync.mutex_lock(&s.parts_mu)
 	for p in s.partitions {
 		day_start := p.day * common.DAY_NS
 		if q.has_start && day_start + common.DAY_NS - 1 < q.start {
@@ -651,6 +654,7 @@ execute_query :: proc(s: ^Store, q: ^Query, default_limit := DEFAULT_QUERY_LIMIT
 			append(&parts, part)
 		}
 	}
+	sync.mutex_unlock(&s.parts_mu)
 	for p in s.partitions {
 		if stop {
 			break

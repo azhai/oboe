@@ -1151,3 +1151,53 @@ P6 的引用计数与并发读写测试（`logdb/storage_more_test.odin`）：
 | `test_part_unlink_without_readers` | 无引用时 unlink 立即清理，不必等 release |
 | `test_concurrent_query_and_merge` | 2 个读线程 + 12 轮摄入/flush/merge/2 轮合并；读侧断言“查询前已提交的行一个不少、无重复” |
 | `test_concurrent_query_and_retention` | 10 个过期分区被逐个移除；读侧断言每个分区要么整块可见、要么完全不可见，当日分区恒完整 |
+
+## 后续优化：独立 merge 线程、parts 独立锁、构建口径（2026-11-03）
+
+针对上一节的「局限」（单刷盘线程封顶、part 数持续增长）落地三项改动。
+
+### 结论
+
+1. **merge 移出刷盘线程**：`store_merge_worker` 独立线程 + `merge_mu` 串行化，每轮
+   `store_merge_all(s, 0)` 连续排水，空闲时 50 ms 轮询。同口径 15 s（5 s × 3 轮）后
+   盘上 part 数 **292 → 53**（第 3 轮结束时的 `oboe_parts`），代价是吞吐 -10~15%、
+   p99 0.98 → 2.0 ms：merge 与 flush 抢 CPU/IO，属于文档已说明的取舍。
+2. **parts 列表独立锁**：flush 追加 part、merge 选源/收尾只拿 `parts_mu`，不再抢
+   `mu` 的写侧。摄入在整批期间持 `mu` 共享锁，读者优先的 rwlock 会让 part 追加等上
+   数百毫秒（`oboe_flush_ms_last` 从 140 ms 抬到 1.5 s），进而把 memtable 积压推高。
+   retention 移除分区时把容器移入 `retired`，由 `store_close` 统一释放，避免与仍在
+   写的 flush/merge 竞争生命周期。
+3. **构建口径必须带 `-o:speed`**：本轮排查中一度出现「合并后只有 1.05M rows/s」的
+   假回归——`oboe` 用 `odin build cmd`（默认无优化）对比时基线二进制是 `-o:speed`
+   构建的 640 KB 版本，而合并后的二进制是 1.17 MB。统一加 `-o:speed` 后同一份代码
+   立刻回到 2.43–2.77M rows/s。基准结论只能在相同编译选项下比较。
+
+### 端到端（8 workers、8 连接、100 行/请求、5 s × 3 轮，均 `-o:speed`）
+
+| 版本 | 第 1/2/3 轮 rows/s | p50 / p99 | 结束时 part 数 | merge 次数 |
+|---|---|---|---|---|
+| 合并主干 HEAD | 2.85M / 2.82M / 2.76M | 0.22 / 0.98 ms | 292（仍在涨） | 16 |
+| 本轮（独立 merge + parts_mu） | 2.30M / 2.40M / 2.53M | 0.23 / 2.0 ms | **53** | 248 |
+
+两版 `oboe_flush_ms_last` 为 263 ms 与 924 ms（后者是 merge 与 flush 并发时单次 swap
+的总耗时）；SIGTERM 收尾都是 1 s。
+
+### 实现要点
+
+- `logdb/store.odin`：`Store.parts_mu`、`Store.retired`、`store_merge_worker`、
+  `store_partition_parts_count`；`store_merge_partition` 对选中的源 part 做
+  `part_retain`/`part_release`，即使 retention 并发移除分区也不会读到已关闭的文件；
+  合并收尾只 unlink「仍在列表里」的源 part，避免与 retention 的 unlink 重复关闭。
+- `store_merge_all` 在 `merge_threshold < 2` 时直接返回，即库内嵌入方（`store_init`）
+  可以把它设为 0/1 关闭合并；注意 `cmd` 的 `-merge-threshold` 只接受 ≥2 的值，传 0
+  会被忽略并沿用默认 8。
+- 移除了合并过程中临时加入的 `probe:` 计时打印，以及 `MEM_BACKLOG_MAX_FACTOR`
+  （按 `flush_max_rows`×4 收紧的软上限）：它把摄入直接绑在刷盘速率上，而硬上限
+  `mem_max_rows` / `mem_max_bytes` 已经足够（实测在 `-o:speed` 口径下没有收益）。
+
+### 测试
+
+- `odin test tests -all-packages` **108 全绿**（含新增
+  `test_merge_worker_keeps_parts_bounded`：6 个 200k part 在后台被合并到
+  `merge_threshold` 以内且行数不丢）。
+- `odin build cmd` / `bench` / `bench/loadgen`（`-o:speed`）均可构建。
